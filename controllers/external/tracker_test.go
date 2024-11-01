@@ -23,10 +23,10 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -55,7 +55,7 @@ func newWatchCountController(raiseError bool) *watchCountController {
 	}
 }
 
-func (c *watchCountController) Watch(_ source.Source, _ handler.EventHandler, _ ...predicate.Predicate) error {
+func (c *watchCountController) Watch(_ source.Source) error {
 	c.count++
 	if c.raiseError {
 		return errors.New("injected failure")
@@ -66,7 +66,7 @@ func (c *watchCountController) Watch(_ source.Source, _ handler.EventHandler, _ 
 func TestRetryWatch(t *testing.T) {
 	g := NewWithT(t)
 	ctrl := newWatchCountController(true)
-	tracker := ObjectTracker{Controller: ctrl}
+	tracker := ObjectTracker{Controller: ctrl, Scheme: runtime.NewScheme(), Cache: &informertest.FakeInformers{}}
 
 	err := tracker.Watch(logger, &clusterv1.Cluster{}, nil)
 	g.Expect(err).To(HaveOccurred())
@@ -80,7 +80,7 @@ func TestRetryWatch(t *testing.T) {
 func TestWatchMultipleTimes(t *testing.T) {
 	g := NewWithT(t)
 	ctrl := &watchCountController{}
-	tracker := ObjectTracker{Controller: ctrl}
+	tracker := ObjectTracker{Controller: ctrl, Scheme: runtime.NewScheme(), Cache: &informertest.FakeInformers{}}
 
 	obj := &clusterv1.Cluster{
 		TypeMeta: metav1.TypeMeta{

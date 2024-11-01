@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	clientcmdv1 "k8s.io/client-go/tools/clientcmd/api/v1"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	bootstrapsecretutil "k8s.io/cluster-bootstrap/util/secrets"
 	"k8s.io/klog/v2"
@@ -40,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/yaml"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
@@ -48,15 +50,15 @@ import (
 	"sigs.k8s.io/cluster-api/bootstrap/kubeadm/internal/locking"
 	kubeadmtypes "sigs.k8s.io/cluster-api/bootstrap/kubeadm/types"
 	bsutil "sigs.k8s.io/cluster-api/bootstrap/util"
-	"sigs.k8s.io/cluster-api/controllers/remote"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/util/taints"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	clog "sigs.k8s.io/cluster-api/util/log"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/paused"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	"sigs.k8s.io/cluster-api/util/secret"
 )
@@ -74,13 +76,14 @@ type InitLocker interface {
 
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kubeadmconfigs;kubeadmconfigs/status;kubeadmconfigs/finalizers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;machinesets;machines;machines/status;machinepools;machinepools/status,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets;events;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // KubeadmConfigReconciler reconciles a KubeadmConfig object.
 type KubeadmConfigReconciler struct {
 	Client              client.Client
 	SecretCachingClient client.Client
-	Tracker             *remote.ClusterCacheTracker
+	ClusterCache        clustercache.ClusterCache
 	KubeadmInitLock     InitLocker
 
 	// WatchFilterValue is the label value used to filter events prior to reconciliation.
@@ -100,6 +103,10 @@ type Scope struct {
 
 // SetupWithManager sets up the reconciler with the Manager.
 func (r *KubeadmConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
+	if r.Client == nil || r.SecretCachingClient == nil || r.ClusterCache == nil || r.TokenTTL == time.Duration(0) {
+		return errors.New("Client, SecretCachingClient and ClusterCache must not be nil and TokenTTL must not be 0")
+	}
+
 	if r.KubeadmInitLock == nil {
 		r.KubeadmInitLock = locking.NewControlPlaneInitMutex(mgr.GetClient())
 	}
@@ -107,13 +114,14 @@ func (r *KubeadmConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		r.TokenTTL = DefaultTokenTTL
 	}
 
+	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "kubeadmconfig")
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&bootstrapv1.KubeadmConfig{}).
 		WithOptions(options).
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.MachineToBootstrapMapFunc),
-		).WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue))
+		).WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue))
 
 	if feature.Gates.Enabled(feature.MachinePool) {
 		b = b.Watches(
@@ -126,12 +134,12 @@ func (r *KubeadmConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		&clusterv1.Cluster{},
 		handler.EnqueueRequestsFromMapFunc(r.ClusterToKubeadmConfigs),
 		builder.WithPredicates(
-			predicates.All(ctrl.LoggerFrom(ctx),
-				predicates.ClusterUnpausedAndInfrastructureReady(ctrl.LoggerFrom(ctx)),
-				predicates.ResourceHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue),
+			predicates.All(mgr.GetScheme(), predicateLog,
+				predicates.ClusterPausedTransitionsOrInfrastructureReady(mgr.GetScheme(), predicateLog),
+				predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
 			),
 		),
-	)
+	).WatchesRawSource(r.ClusterCache.GetClusterSource("kubeadmconfig", r.ClusterToKubeadmConfigs))
 
 	if err := b.Complete(r); err != nil {
 		return errors.Wrap(err, "failed setting up with a controller manager")
@@ -154,11 +162,11 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Look up the owner of this kubeadm config if there is one
 	configOwner, err := bsutil.GetTypedConfigOwner(ctx, r.Client, config)
-	if apierrors.IsNotFound(err) {
-		// Could not find the owner yet, this is not an error and will rereconcile when the owner gets set.
-		return ctrl.Result{}, nil
-	}
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Could not find the owner yet, this is not an error and will rereconcile when the owner gets set.
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, errors.Wrapf(err, "failed to get owner")
 	}
 	if configOwner == nil {
@@ -195,9 +203,8 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	if annotations.IsPaused(cluster, config) {
-		log.Info("Reconciliation is paused for this object")
-		return ctrl.Result{}, nil
+	if isPaused, conditionChanged, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, config); err != nil || isPaused || conditionChanged {
+		return ctrl.Result{}, err
 	}
 
 	scope := &Scope{
@@ -238,10 +245,8 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	res, err := r.reconcile(ctx, scope, cluster, config, configOwner)
-	if err != nil && errors.Is(err, remote.ErrClusterLocked) {
-		// Requeue if the reconcile failed because the ClusterCacheTracker was locked for
-		// the current cluster because of concurrent access.
-		log.V(5).Info("Requeuing because another worker has the lock on the ClusterCacheTracker")
+	if err != nil && errors.Is(err, clustercache.ErrClusterNotConnected) {
+		log.V(5).Info("Requeuing because connection to the workload cluster is down")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return res, err
@@ -316,7 +321,7 @@ func (r *KubeadmConfigReconciler) refreshBootstrapTokenIfNeeded(ctx context.Cont
 	log := ctrl.LoggerFrom(ctx)
 	token := config.Spec.JoinConfiguration.Discovery.BootstrapToken.Token
 
-	remoteClient, err := r.Tracker.GetClient(ctx, util.ObjectKey(cluster))
+	remoteClient, err := r.ClusterCache.GetClient(ctx, util.ObjectKey(cluster))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -363,7 +368,7 @@ func (r *KubeadmConfigReconciler) refreshBootstrapTokenIfNeeded(ctx context.Cont
 func (r *KubeadmConfigReconciler) rotateMachinePoolBootstrapToken(ctx context.Context, config *bootstrapv1.KubeadmConfig, cluster *clusterv1.Cluster, scope *Scope) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 	log.V(2).Info("Config is owned by a MachinePool, checking if token should be rotated")
-	remoteClient, err := r.Tracker.GetClient(ctx, util.ObjectKey(cluster))
+	remoteClient, err := r.ClusterCache.GetClient(ctx, util.ObjectKey(cluster))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -445,25 +450,10 @@ func (r *KubeadmConfigReconciler) handleClusterNotInitialized(ctx context.Contex
 		return ctrl.Result{}, errors.Wrapf(err, "failed to parse kubernetes version %q", kubernetesVersion)
 	}
 
-	if scope.Config.Spec.InitConfiguration == nil {
-		scope.Config.Spec.InitConfiguration = &bootstrapv1.InitConfiguration{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: "kubeadm.k8s.io/v1beta3",
-				Kind:       "InitConfiguration",
-			},
-		}
-	}
-
-	initdata, err := kubeadmtypes.MarshalInitConfigurationForVersion(scope.Config.Spec.InitConfiguration, parsedVersion)
-	if err != nil {
-		scope.Error(err, "Failed to marshal init configuration")
-		return ctrl.Result{}, err
-	}
-
 	if scope.Config.Spec.ClusterConfiguration == nil {
 		scope.Config.Spec.ClusterConfiguration = &bootstrapv1.ClusterConfiguration{
 			TypeMeta: metav1.TypeMeta{
-				APIVersion: "kubeadm.k8s.io/v1beta3",
+				APIVersion: "kubeadm.k8s.io/v1beta4",
 				Kind:       "ClusterConfiguration",
 			},
 		}
@@ -475,6 +465,23 @@ func (r *KubeadmConfigReconciler) handleClusterNotInitialized(ctx context.Contex
 	clusterdata, err := kubeadmtypes.MarshalClusterConfigurationForVersion(scope.Config.Spec.ClusterConfiguration, parsedVersion)
 	if err != nil {
 		scope.Error(err, "Failed to marshal cluster configuration")
+		return ctrl.Result{}, err
+	}
+
+	if scope.Config.Spec.InitConfiguration == nil {
+		scope.Config.Spec.InitConfiguration = &bootstrapv1.InitConfiguration{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "kubeadm.k8s.io/v1beta4",
+				Kind:       "InitConfiguration",
+			},
+		}
+	}
+
+	// NOTE: It is required to provide in input the ClusterConfiguration because clusterConfiguration.APIServer.TimeoutForControlPlane
+	// has been migrated to InitConfiguration in the kubeadm v1beta4 API version.
+	initdata, err := kubeadmtypes.MarshalInitConfigurationForVersion(scope.Config.Spec.ClusterConfiguration, scope.Config.Spec.InitConfiguration, parsedVersion)
+	if err != nil {
+		scope.Error(err, "Failed to marshal init configuration")
 		return ctrl.Result{}, err
 	}
 
@@ -530,6 +537,7 @@ func (r *KubeadmConfigReconciler) handleClusterNotInitialized(ctx context.Contex
 			Mounts:              scope.Config.Spec.Mounts,
 			DiskSetup:           scope.Config.Spec.DiskSetup,
 			KubeadmVerbosity:    verbosityFlag,
+			KubernetesVersion:   parsedVersion,
 		},
 		InitConfiguration:    initdata,
 		ClusterConfiguration: clusterdata,
@@ -602,7 +610,9 @@ func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope) 
 		joinConfiguration.NodeRegistration.Taints = append(joinConfiguration.NodeRegistration.Taints, clusterv1.NodeUninitializedTaint)
 	}
 
-	joinData, err := kubeadmtypes.MarshalJoinConfigurationForVersion(joinConfiguration, parsedVersion)
+	// NOTE: It is not required to provide in input ClusterConfiguration because only clusterConfiguration.APIServer.TimeoutForControlPlane
+	// has been migrated to JoinConfiguration in the kubeadm v1beta4 API version, and this field does not apply to workers.
+	joinData, err := kubeadmtypes.MarshalJoinConfigurationForVersion(nil, joinConfiguration, parsedVersion)
 	if err != nil {
 		scope.Error(err, "Failed to marshal join configuration")
 		return ctrl.Result{}, err
@@ -629,6 +639,15 @@ func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope) 
 		return ctrl.Result{}, err
 	}
 
+	if discoveryFile := scope.Config.Spec.JoinConfiguration.Discovery.File; discoveryFile != nil && discoveryFile.KubeConfig != nil {
+		kubeconfig, err := r.resolveDiscoveryKubeConfig(discoveryFile)
+		if err != nil {
+			conditions.MarkFalse(scope.Config, bootstrapv1.DataSecretAvailableCondition, bootstrapv1.DataSecretGenerationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			return ctrl.Result{}, err
+		}
+		files = append(files, *kubeconfig)
+	}
+
 	nodeInput := &cloudinit.NodeInput{
 		BaseUserData: cloudinit.BaseUserData{
 			AdditionalFiles:      files,
@@ -640,6 +659,7 @@ func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope) 
 			DiskSetup:            scope.Config.Spec.DiskSetup,
 			KubeadmVerbosity:     verbosityFlag,
 			UseExperimentalRetry: scope.Config.Spec.UseExperimentalRetryJoin,
+			KubernetesVersion:    parsedVersion,
 		},
 		JoinConfiguration: joinData,
 	}
@@ -711,7 +731,9 @@ func (r *KubeadmConfigReconciler) joinControlplane(ctx context.Context, scope *S
 		return ctrl.Result{}, errors.Wrapf(err, "failed to parse kubernetes version %q", kubernetesVersion)
 	}
 
-	joinData, err := kubeadmtypes.MarshalJoinConfigurationForVersion(scope.Config.Spec.JoinConfiguration, parsedVersion)
+	// NOTE: It is required to provide in input the ClusterConfiguration because clusterConfiguration.APIServer.TimeoutForControlPlane
+	// has been migrated to JoinConfiguration in the kubeadm v1beta4 API version.
+	joinData, err := kubeadmtypes.MarshalJoinConfigurationForVersion(scope.Config.Spec.ClusterConfiguration, scope.Config.Spec.JoinConfiguration, parsedVersion)
 	if err != nil {
 		scope.Error(err, "Failed to marshal join configuration")
 		return ctrl.Result{}, err
@@ -734,6 +756,15 @@ func (r *KubeadmConfigReconciler) joinControlplane(ctx context.Context, scope *S
 		return ctrl.Result{}, err
 	}
 
+	if discoveryFile := scope.Config.Spec.JoinConfiguration.Discovery.File; discoveryFile != nil && discoveryFile.KubeConfig != nil {
+		kubeconfig, err := r.resolveDiscoveryKubeConfig(discoveryFile)
+		if err != nil {
+			conditions.MarkFalse(scope.Config, bootstrapv1.DataSecretAvailableCondition, bootstrapv1.DataSecretGenerationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			return ctrl.Result{}, err
+		}
+		files = append(files, *kubeconfig)
+	}
+
 	controlPlaneJoinInput := &cloudinit.ControlPlaneJoinInput{
 		JoinConfiguration: joinData,
 		Certificates:      certificates,
@@ -747,6 +778,7 @@ func (r *KubeadmConfigReconciler) joinControlplane(ctx context.Context, scope *S
 			DiskSetup:            scope.Config.Spec.DiskSetup,
 			KubeadmVerbosity:     verbosityFlag,
 			UseExperimentalRetry: scope.Config.Spec.UseExperimentalRetryJoin,
+			KubernetesVersion:    parsedVersion,
 		},
 	}
 
@@ -833,6 +865,66 @@ func (r *KubeadmConfigReconciler) resolveUsers(ctx context.Context, cfg *bootstr
 	}
 
 	return collected, nil
+}
+
+func (r *KubeadmConfigReconciler) resolveDiscoveryKubeConfig(cfg *bootstrapv1.FileDiscovery) (*bootstrapv1.File, error) {
+	if cfg == nil || cfg.KubeConfig == nil {
+		return nil, errors.New("no discovery configuration file to resolve")
+	}
+	if cfg.KubeConfig.Cluster == nil {
+		return nil, errors.New("expected discovery kubeconfig cluster to not be empty")
+	}
+	cluster := clientcmdv1.Cluster{
+		Server:                   cfg.KubeConfig.Cluster.Server,
+		TLSServerName:            cfg.KubeConfig.Cluster.TLSServerName,
+		InsecureSkipTLSVerify:    cfg.KubeConfig.Cluster.InsecureSkipTLSVerify,
+		CertificateAuthorityData: cfg.KubeConfig.Cluster.CertificateAuthorityData,
+		ProxyURL:                 cfg.KubeConfig.Cluster.ProxyURL,
+	}
+	user := clientcmdv1.AuthInfo{}
+	if cfg.KubeConfig.User.AuthProvider != nil {
+		user.AuthProvider = &clientcmdv1.AuthProviderConfig{
+			Name:   cfg.KubeConfig.User.AuthProvider.Name,
+			Config: cfg.KubeConfig.User.AuthProvider.Config,
+		}
+	}
+	if cfg.KubeConfig.User.Exec != nil {
+		user.Exec = &clientcmdv1.ExecConfig{
+			Command:            cfg.KubeConfig.User.Exec.Command,
+			Args:               cfg.KubeConfig.User.Exec.Args,
+			APIVersion:         cfg.KubeConfig.User.Exec.APIVersion,
+			ProvideClusterInfo: cfg.KubeConfig.User.Exec.ProvideClusterInfo,
+			InteractiveMode:    "Never",
+		}
+		for _, env := range cfg.KubeConfig.User.Exec.Env {
+			user.Exec.Env = append(user.Exec.Env, clientcmdv1.ExecEnvVar{Name: env.Name, Value: env.Value})
+		}
+	}
+	kubeconfig := clientcmdv1.Config{
+		CurrentContext: "default",
+		Contexts: []clientcmdv1.NamedContext{
+			{
+				Name: "default",
+				Context: clientcmdv1.Context{
+					Cluster:  "default",
+					AuthInfo: "default",
+				},
+			},
+		},
+		Clusters:  []clientcmdv1.NamedCluster{{Name: "default", Cluster: cluster}},
+		AuthInfos: []clientcmdv1.NamedAuthInfo{{Name: "default", AuthInfo: user}},
+	}
+
+	b, err := yaml.Marshal(kubeconfig)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to marshal kubeconfig from JoinConfiguration.Discovery.File.KubeConfig")
+	}
+	return &bootstrapv1.File{
+		Path:        cfg.KubeConfigPath,
+		Owner:       "root:root",
+		Permissions: "0640",
+		Content:     string(b),
+	}, nil
 }
 
 // resolveSecretUserContent returns passwd fetched from a referenced secret object.
@@ -963,7 +1055,7 @@ func (r *KubeadmConfigReconciler) reconcileDiscovery(ctx context.Context, cluste
 
 	// if config already contains a file discovery configuration, respect it without further validations
 	if config.Spec.JoinConfiguration.Discovery.File != nil {
-		return ctrl.Result{}, nil
+		return r.reconcileDiscoveryFile(ctx, cluster, config, certificates)
 	}
 
 	// otherwise it is necessary to ensure token discovery is properly configured
@@ -991,12 +1083,12 @@ func (r *KubeadmConfigReconciler) reconcileDiscovery(ctx context.Context, cluste
 
 		apiServerEndpoint = cluster.Spec.ControlPlaneEndpoint.String()
 		config.Spec.JoinConfiguration.Discovery.BootstrapToken.APIServerEndpoint = apiServerEndpoint
-		log.V(3).Info("Altering JoinConfiguration.Discovery.BootstrapToken.APIServerEndpoint", "APIServerEndpoint", apiServerEndpoint)
+		log.V(3).Info("Altering JoinConfiguration.Discovery.BootstrapToken.APIServerEndpoint", "apiServerEndpoint", apiServerEndpoint)
 	}
 
 	// if BootstrapToken already contains a token, respect it; otherwise create a new bootstrap token for the node to join
 	if config.Spec.JoinConfiguration.Discovery.BootstrapToken.Token == "" {
-		remoteClient, err := r.Tracker.GetClient(ctx, util.ObjectKey(cluster))
+		remoteClient, err := r.ClusterCache.GetClient(ctx, util.ObjectKey(cluster))
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1019,6 +1111,41 @@ func (r *KubeadmConfigReconciler) reconcileDiscovery(ctx context.Context, cluste
 	return ctrl.Result{}, nil
 }
 
+func (r *KubeadmConfigReconciler) reconcileDiscoveryFile(ctx context.Context, cluster *clusterv1.Cluster, config *bootstrapv1.KubeadmConfig, certificates secret.Certificates) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+	cfg := config.Spec.JoinConfiguration.Discovery.File.KubeConfig
+	if cfg == nil {
+		// Nothing else to do.
+		return ctrl.Result{}, nil
+	}
+
+	if cfg.Cluster == nil {
+		cfg.Cluster = &bootstrapv1.KubeConfigCluster{}
+	}
+
+	if cfg.Cluster.Server == "" {
+		if !cluster.Spec.ControlPlaneEndpoint.IsValid() {
+			log.V(1).Info("Waiting for Cluster Controller to set Cluster.Spec.ControlPlaneEndpoint")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		cfg.Cluster.Server = fmt.Sprintf("https://%s", cluster.Spec.ControlPlaneEndpoint.String())
+		log.V(3).Info("Altering JoinConfiguration.Discovery.File.KubeConfig.Cluster.Server", "server", cfg.Cluster.Server)
+	}
+
+	if len(cfg.Cluster.CertificateAuthorityData) == 0 {
+		clusterCA := certificates.GetByPurpose(secret.ClusterCA)
+		if clusterCA == nil || clusterCA.KeyPair == nil {
+			err := fmt.Errorf("failed to retrieve Cluster CA")
+			log.Error(err, "Unable to set Cluster CA for Discovery.File.KubeConfig")
+			return ctrl.Result{}, err
+		}
+		cfg.Cluster.CertificateAuthorityData = clusterCA.KeyPair.Cert
+		log.V(3).Info("Altering JoinConfiguration.Discovery.File.KubeConfig.Cluster.CertificateAuthorityData")
+	}
+
+	return ctrl.Result{}, nil
+}
+
 // reconcileTopLevelObjectSettings injects into config.ClusterConfiguration values from top level objects like cluster and machine.
 // The implementation func respect user provided config values, but in case some of them are missing, values from top level objects are used.
 func (r *KubeadmConfigReconciler) reconcileTopLevelObjectSettings(ctx context.Context, cluster *clusterv1.Cluster, machine *clusterv1.Machine, config *bootstrapv1.KubeadmConfig) {
@@ -1029,39 +1156,39 @@ func (r *KubeadmConfigReconciler) reconcileTopLevelObjectSettings(ctx context.Co
 	// then use Cluster's ControlPlaneEndpoint as a control plane endpoint for the Kubernetes cluster.
 	if config.Spec.ClusterConfiguration.ControlPlaneEndpoint == "" && cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		config.Spec.ClusterConfiguration.ControlPlaneEndpoint = cluster.Spec.ControlPlaneEndpoint.String()
-		log.V(3).Info("Altering ClusterConfiguration.ControlPlaneEndpoint", "ControlPlaneEndpoint", config.Spec.ClusterConfiguration.ControlPlaneEndpoint)
+		log.V(3).Info("Altering ClusterConfiguration.ControlPlaneEndpoint", "controlPlaneEndpoint", config.Spec.ClusterConfiguration.ControlPlaneEndpoint)
 	}
 
 	// If there are no ClusterName defined in ClusterConfiguration, use Cluster.Name
 	if config.Spec.ClusterConfiguration.ClusterName == "" {
 		config.Spec.ClusterConfiguration.ClusterName = cluster.Name
-		log.V(3).Info("Altering ClusterConfiguration.ClusterName", "ClusterName", config.Spec.ClusterConfiguration.ClusterName)
+		log.V(3).Info("Altering ClusterConfiguration.ClusterName", "clusterName", config.Spec.ClusterConfiguration.ClusterName)
 	}
 
 	// If there are no Network settings defined in ClusterConfiguration, use ClusterNetwork settings, if defined
 	if cluster.Spec.ClusterNetwork != nil {
 		if config.Spec.ClusterConfiguration.Networking.DNSDomain == "" && cluster.Spec.ClusterNetwork.ServiceDomain != "" {
 			config.Spec.ClusterConfiguration.Networking.DNSDomain = cluster.Spec.ClusterNetwork.ServiceDomain
-			log.V(3).Info("Altering ClusterConfiguration.Networking.DNSDomain", "DNSDomain", config.Spec.ClusterConfiguration.Networking.DNSDomain)
+			log.V(3).Info("Altering ClusterConfiguration.Networking.DNSDomain", "dnsDomain", config.Spec.ClusterConfiguration.Networking.DNSDomain)
 		}
 		if config.Spec.ClusterConfiguration.Networking.ServiceSubnet == "" &&
 			cluster.Spec.ClusterNetwork.Services != nil &&
 			len(cluster.Spec.ClusterNetwork.Services.CIDRBlocks) > 0 {
 			config.Spec.ClusterConfiguration.Networking.ServiceSubnet = cluster.Spec.ClusterNetwork.Services.String()
-			log.V(3).Info("Altering ClusterConfiguration.Networking.ServiceSubnet", "ServiceSubnet", config.Spec.ClusterConfiguration.Networking.ServiceSubnet)
+			log.V(3).Info("Altering ClusterConfiguration.Networking.ServiceSubnet", "serviceSubnet", config.Spec.ClusterConfiguration.Networking.ServiceSubnet)
 		}
 		if config.Spec.ClusterConfiguration.Networking.PodSubnet == "" &&
 			cluster.Spec.ClusterNetwork.Pods != nil &&
 			len(cluster.Spec.ClusterNetwork.Pods.CIDRBlocks) > 0 {
 			config.Spec.ClusterConfiguration.Networking.PodSubnet = cluster.Spec.ClusterNetwork.Pods.String()
-			log.V(3).Info("Altering ClusterConfiguration.Networking.PodSubnet", "PodSubnet", config.Spec.ClusterConfiguration.Networking.PodSubnet)
+			log.V(3).Info("Altering ClusterConfiguration.Networking.PodSubnet", "podSubnet", config.Spec.ClusterConfiguration.Networking.PodSubnet)
 		}
 	}
 
 	// If there are no KubernetesVersion settings defined in ClusterConfiguration, use Version from machine, if defined
 	if config.Spec.ClusterConfiguration.KubernetesVersion == "" && machine.Spec.Version != nil {
 		config.Spec.ClusterConfiguration.KubernetesVersion = *machine.Spec.Version
-		log.V(3).Info("Altering ClusterConfiguration.KubernetesVersion", "KubernetesVersion", config.Spec.ClusterConfiguration.KubernetesVersion)
+		log.V(3).Info("Altering ClusterConfiguration.KubernetesVersion", "kubernetesVersion", config.Spec.ClusterConfiguration.KubernetesVersion)
 	}
 }
 

@@ -31,8 +31,8 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/exp/topology/scope"
-	"sigs.k8s.io/cluster-api/internal/test/builder"
 	"sigs.k8s.io/cluster-api/internal/topology/selectors"
+	"sigs.k8s.io/cluster-api/util/test/builder"
 )
 
 func TestGetCurrentState(t *testing.T) {
@@ -458,9 +458,11 @@ func TestGetCurrentState(t *testing.T) {
 				ControlPlane:          &scope.ControlPlaneState{},
 				InfrastructureCluster: nil,
 				MachineDeployments: map[string]*scope.MachineDeploymentState{
-					"md1": {Object: machineDeployment, BootstrapTemplate: machineDeploymentBootstrap, InfrastructureMachineTemplate: machineDeploymentInfrastructure}},
+					"md1": {Object: machineDeployment, BootstrapTemplate: machineDeploymentBootstrap, InfrastructureMachineTemplate: machineDeploymentInfrastructure},
+				},
 				MachinePools: map[string]*scope.MachinePoolState{
-					"mp1": {Object: machinePool, BootstrapObject: machinePoolBootstrap, InfrastructureMachinePoolObject: machinePoolInfrastructure}},
+					"mp1": {Object: machinePool, BootstrapObject: machinePoolBootstrap, InfrastructureMachinePoolObject: machinePoolInfrastructure},
+				},
 			},
 		},
 		{
@@ -1077,10 +1079,9 @@ func TestGetCurrentState(t *testing.T) {
 
 			// Calls getCurrentState.
 			r := &Reconciler{
-				Client:                    fakeClient,
-				APIReader:                 fakeClient,
-				UnstructuredCachingClient: fakeClient,
-				patchHelperFactory:        dryRunPatchHelperFactory(fakeClient),
+				Client:             fakeClient,
+				APIReader:          fakeClient,
+				patchHelperFactory: dryRunPatchHelperFactory(fakeClient),
 			}
 			got, err := r.getCurrentState(ctx, s)
 

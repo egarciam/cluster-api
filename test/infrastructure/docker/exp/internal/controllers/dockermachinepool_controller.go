@@ -20,11 +20,10 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"time"
+	"sort"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -40,7 +39,6 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/controllers/external"
-	"sigs.k8s.io/cluster-api/controllers/remote"
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	utilexp "sigs.k8s.io/cluster-api/exp/util"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
@@ -64,9 +62,7 @@ const (
 // DockerMachinePoolReconciler reconciles a DockerMachinePool object.
 type DockerMachinePoolReconciler struct {
 	Client           client.Client
-	Scheme           *runtime.Scheme
 	ContainerRuntime container.Runtime
-	Tracker          *remote.ClusterCacheTracker
 
 	// WatchFilterValue is the label value used to filter events prior to reconciliation.
 	WatchFilterValue string
@@ -132,7 +128,7 @@ func (r *DockerMachinePoolReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// Always attempt to Patch the DockerMachinePool object and status after each reconciliation.
 	defer func() {
 		if err := patchDockerMachinePool(ctx, patchHelper, dockerMachinePool); err != nil {
-			log.Error(err, "failed to patch DockerMachinePool")
+			log.Error(err, "Failed to patch DockerMachinePool")
 			if rerr == nil {
 				rerr = err
 			}
@@ -154,18 +150,16 @@ func (r *DockerMachinePoolReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// Handle non-deleted machines
-	res, err = r.reconcileNormal(ctx, cluster, machinePool, dockerMachinePool)
-	// Requeue if the reconcile failed because the ClusterCacheTracker was locked for
-	// the current cluster because of concurrent access.
-	if errors.Is(err, remote.ErrClusterLocked) {
-		log.V(5).Info("Requeuing because another worker has the lock on the ClusterCacheTracker")
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
-	return res, err
+	return r.reconcileNormal(ctx, cluster, machinePool, dockerMachinePool)
 }
 
 // SetupWithManager will add watches for this controller.
 func (r *DockerMachinePoolReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
+	if r.Client == nil || r.ContainerRuntime == nil {
+		return errors.New("Client and ContainerRuntime must not be nil")
+	}
+
+	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "dockermachinepool")
 	clusterToDockerMachinePools, err := util.ClusterToTypedObjectsMapper(mgr.GetClient(), &infraexpv1.DockerMachinePoolList{}, mgr.GetScheme())
 	if err != nil {
 		return err
@@ -174,11 +168,11 @@ func (r *DockerMachinePoolReconciler) SetupWithManager(ctx context.Context, mgr 
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&infraexpv1.DockerMachinePool{}).
 		WithOptions(options).
-		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue)).
+		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Watches(
 			&expv1.MachinePool{},
-			handler.EnqueueRequestsFromMapFunc(utilexp.MachinePoolToInfrastructureMapFunc(
-				infraexpv1.GroupVersion.WithKind("DockerMachinePool"), ctrl.LoggerFrom(ctx))),
+			handler.EnqueueRequestsFromMapFunc(utilexp.MachinePoolToInfrastructureMapFunc(ctx,
+				infraexpv1.GroupVersion.WithKind("DockerMachinePool"))),
 		).
 		Watches(
 			&infrav1.DockerMachine{},
@@ -188,7 +182,8 @@ func (r *DockerMachinePoolReconciler) SetupWithManager(ctx context.Context, mgr 
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(clusterToDockerMachinePools),
 			builder.WithPredicates(
-				predicates.ClusterUnpausedAndInfrastructureReady(ctrl.LoggerFrom(ctx)),
+				//nolint:staticcheck // This usage will be removed when adding v1beta2 status and implementing the Paused condition.
+				predicates.ClusterUnpausedAndInfrastructureReady(mgr.GetScheme(), predicateLog),
 			),
 		).Build(r)
 	if err != nil {
@@ -199,6 +194,7 @@ func (r *DockerMachinePoolReconciler) SetupWithManager(ctx context.Context, mgr 
 	r.externalTracker = external.ObjectTracker{
 		Controller: c,
 		Cache:      mgr.GetCache(),
+		Scheme:     mgr.GetScheme(),
 	}
 	r.ssaCache = ssa.NewCache()
 
@@ -302,6 +298,8 @@ func (r *DockerMachinePoolReconciler) reconcileNormal(ctx context.Context, clust
 			dockerMachinePool.Spec.ProviderIDList = append(dockerMachinePool.Spec.ProviderIDList, *dockerMachine.Spec.ProviderID)
 		}
 	}
+	// Ensure the providerIDList is deterministic (getDockerMachines doesn't guarantee a specific order)
+	sort.Strings(dockerMachinePool.Spec.ProviderIDList)
 
 	dockerMachinePool.Status.Replicas = int32(len(dockerMachineList.Items))
 
@@ -378,7 +376,7 @@ func dockerMachineToDockerMachinePool(_ context.Context, o client.Object) []ctrl
 }
 
 // updateStatus updates the Status field for the MachinePool object.
-// It checks for the current state of the replicas and updates the Status of the MachineSet.
+// It checks for the current state of the replicas and updates the Status of the MachinePool.
 func (r *DockerMachinePoolReconciler) updateStatus(ctx context.Context, cluster *clusterv1.Cluster, machinePool *expv1.MachinePool, dockerMachinePool *infraexpv1.DockerMachinePool, dockerMachines []infrav1.DockerMachine) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -405,10 +403,10 @@ func (r *DockerMachinePoolReconciler) updateStatus(ctx context.Context, cluster 
 	switch {
 	// We are scaling up
 	case readyReplicaCount < desiredReplicas:
-		conditions.MarkFalse(dockerMachinePool, clusterv1.ResizedCondition, clusterv1.ScalingUpReason, clusterv1.ConditionSeverityWarning, "Scaling up MachineSet to %d replicas (actual %d)", desiredReplicas, readyReplicaCount)
+		conditions.MarkFalse(dockerMachinePool, clusterv1.ResizedCondition, clusterv1.ScalingUpReason, clusterv1.ConditionSeverityWarning, "Scaling up MachinePool to %d replicas (actual %d)", desiredReplicas, readyReplicaCount)
 	// We are scaling down
 	case readyReplicaCount > desiredReplicas:
-		conditions.MarkFalse(dockerMachinePool, clusterv1.ResizedCondition, clusterv1.ScalingDownReason, clusterv1.ConditionSeverityWarning, "Scaling down MachineSet to %d replicas (actual %d)", desiredReplicas, readyReplicaCount)
+		conditions.MarkFalse(dockerMachinePool, clusterv1.ResizedCondition, clusterv1.ScalingDownReason, clusterv1.ConditionSeverityWarning, "Scaling down MachinePool to %d replicas (actual %d)", desiredReplicas, readyReplicaCount)
 	default:
 		// Make sure last resize operation is marked as completed.
 		// NOTE: we are checking the number of machines ready so we report resize completed only when the machines

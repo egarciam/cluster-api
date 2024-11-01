@@ -13,9 +13,7 @@
 ### 👋 Welcome to our project! Our [Book](https://cluster-api.sigs.k8s.io) can help you get started and provides lots of in-depth information.
 
 #### Useful links
-- [Scope, objectives, goals and requirements](./docs/scope-and-objectives.md)
 - [Feature proposals](./docs/proposals)
-- [Reference use cases](./docs/staging-use-cases.md)
 - [Quick Start](https://cluster-api.sigs.k8s.io/user/quick-start.html)
 
 ## ✨ What is the Cluster API?
@@ -37,7 +35,7 @@ Cluster API is developed in the open, and is constantly being improved by our us
 If you have questions or want to get the latest project news, you can connect with us in the following ways:
 
 - Chat with us on the Kubernetes [Slack](http://slack.k8s.io/) in the [#cluster-api][#cluster-api slack] channel
-- Subscribe to the [SIG Cluster Lifecycle](https://groups.google.com/forum/#!forum/kubernetes-sig-cluster-lifecycle) Google Group for access to documents and calendars
+- Subscribe to the [SIG Cluster Lifecycle](https://groups.google.com/a/kubernetes.io/g/sig-cluster-lifecycle) Google Group for access to documents and calendars
 - Join our Cluster API working group sessions where we share the latest project news, demos, answer questions, and triage issues
     - Weekly on Wednesdays @ 10:00 PT on [Zoom][zoomMeeting]
     - Previous meetings: \[ [notes][notes] | [recordings][recordings] \]

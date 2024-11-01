@@ -41,11 +41,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/component-base/logs"
+	logsv1 "k8s.io/component-base/logs/api/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -62,15 +65,34 @@ import (
 	expipamwebhooks "sigs.k8s.io/cluster-api/exp/ipam/webhooks"
 	runtimev1 "sigs.k8s.io/cluster-api/exp/runtime/api/v1alpha1"
 	expapiwebhooks "sigs.k8s.io/cluster-api/exp/webhooks"
-	"sigs.k8s.io/cluster-api/internal/test/builder"
 	internalwebhooks "sigs.k8s.io/cluster-api/internal/webhooks"
 	runtimewebhooks "sigs.k8s.io/cluster-api/internal/webhooks/runtime"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
+	"sigs.k8s.io/cluster-api/util/test/builder"
 	"sigs.k8s.io/cluster-api/version"
 	"sigs.k8s.io/cluster-api/webhooks"
 )
 
 func init() {
+	// This has to be done so klog.Background() uses a proper logger.
+	// Otherwise it would fall back and log to os.Stderr.
+	// This would lead to race conditions because input.M.Run() writes os.Stderr
+	// while some go routines in controller-runtime use os.Stderr to write logs.
+	logOptions := logs.NewOptions()
+	logOptions.Verbosity = logsv1.VerbosityLevel(2)
+	if logLevel := os.Getenv("CAPI_TEST_ENV_LOG_LEVEL"); logLevel != "" {
+		logLevelInt, err := strconv.Atoi(logLevel)
+		if err != nil {
+			klog.ErrorS(err, "Unable to convert value of CAPI_TEST_ENV_LOG_LEVEL environment variable to integer")
+			os.Exit(1)
+		}
+		logOptions.Verbosity = logsv1.VerbosityLevel(logLevelInt)
+	}
+	if err := logsv1.ValidateAndApply(logOptions, nil); err != nil {
+		klog.ErrorS(err, "Unable to validate and apply log options")
+		os.Exit(1)
+	}
+
 	logger := klog.Background()
 	// Use klog as the internal logger for this envtest environment.
 	log.SetLogger(logger)
@@ -90,6 +112,7 @@ func init() {
 	utilruntime.Must(admissionv1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(runtimev1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(ipamv1.AddToScheme(scheme.Scheme))
+	utilruntime.Must(builder.AddTransitionV1Beta2ToScheme(scheme.Scheme))
 }
 
 // RunInput is the input for Run.
@@ -138,7 +161,7 @@ func Run(ctx context.Context, input RunInput) int {
 		config := kubeconfig.FromEnvTestConfig(env.Config, &clusterv1.Cluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "test"},
 		})
-		if err := os.WriteFile(kubeconfigPath, config, 0600); err != nil {
+		if err := os.WriteFile(kubeconfigPath, config, 0o600); err != nil {
 			panic(errors.Wrapf(err, "failed to write the test env kubeconfig"))
 		}
 	}
@@ -164,21 +187,30 @@ func Run(ctx context.Context, input RunInput) int {
 		return code
 	}
 
+	var errs []error
+
+	if err := verifyPanicMetrics(); err != nil {
+		errs = append(errs, errors.Wrapf(err, "panics occurred during tests"))
+	}
+
 	// Tearing down the test environment
 	if err := env.stop(); err != nil {
-		panic(fmt.Sprintf("Failed to stop the test environment: %v", err))
+		errs = append(errs, errors.Wrapf(err, "failed to stop the test environment"))
 	}
+
+	if len(errs) > 0 {
+		panic(kerrors.NewAggregate(errs))
+	}
+
 	return code
 }
 
-var (
-	cacheSyncBackoff = wait.Backoff{
-		Duration: 100 * time.Millisecond,
-		Factor:   1.5,
-		Steps:    8,
-		Jitter:   0.4,
-	}
-)
+var cacheSyncBackoff = wait.Backoff{
+	Duration: 100 * time.Millisecond,
+	Factor:   1.5,
+	Steps:    8,
+	Jitter:   0.4,
+}
 
 // Environment encapsulates a Kubernetes local test environment.
 type Environment struct {
@@ -206,6 +238,7 @@ func newEnvironment(uncachedObjs ...client.Object) *Environment {
 			filepath.Join(root, "config", "crd", "bases"),
 			filepath.Join(root, "controlplane", "kubeadm", "config", "crd", "bases"),
 			filepath.Join(root, "bootstrap", "kubeadm", "config", "crd", "bases"),
+			filepath.Join(root, "util", "test", "builder", "crd"),
 		},
 		CRDs: []*apiextensionsv1.CustomResourceDefinition{
 			builder.GenericBootstrapConfigCRD.DeepCopy(),
@@ -260,6 +293,8 @@ func newEnvironment(uncachedObjs ...client.Object) *Environment {
 		Client: client.Options{
 			Cache: &client.CacheOptions{
 				DisableFor: uncachedObjs,
+				// Use the cache for all Unstructured get/list calls.
+				Unstructured: true,
 			},
 		},
 		WebhookServer: webhook.NewServer(
@@ -289,9 +324,6 @@ func newEnvironment(uncachedObjs ...client.Object) *Environment {
 		klog.Fatalf("unable to create webhook: %+v", err)
 	}
 	if err := (&webhooks.MachineHealthCheck{}).SetupWebhookWithManager(mgr); err != nil {
-		klog.Fatalf("unable to create webhook: %+v", err)
-	}
-	if err := (&webhooks.Machine{}).SetupWebhookWithManager(mgr); err != nil {
 		klog.Fatalf("unable to create webhook: %+v", err)
 	}
 	if err := (&webhooks.MachineSet{}).SetupWebhookWithManager(mgr); err != nil {
@@ -384,7 +416,7 @@ func (e *Environment) waitForWebhooks() {
 
 // CreateKubeconfigSecret generates a new Kubeconfig secret from the envtest config.
 func (e *Environment) CreateKubeconfigSecret(ctx context.Context, cluster *clusterv1.Cluster) error {
-	return e.Create(ctx, kubeconfig.GenerateSecret(cluster, kubeconfig.FromEnvTestConfig(e.Config, cluster)))
+	return e.CreateAndWait(ctx, kubeconfig.GenerateSecret(cluster, kubeconfig.FromEnvTestConfig(e.Config, cluster)))
 }
 
 // Cleanup deletes all the given objects.
@@ -514,4 +546,42 @@ func (e *Environment) CreateNamespace(ctx context.Context, generateName string) 
 	}
 
 	return ns, nil
+}
+
+func verifyPanicMetrics() error {
+	metricFamilies, err := metrics.Registry.Gather()
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+	for _, metricFamily := range metricFamilies {
+		if metricFamily.GetName() == "controller_runtime_reconcile_panics_total" {
+			for _, controllerPanicMetric := range metricFamily.Metric {
+				if controllerPanicMetric.Counter != nil && controllerPanicMetric.Counter.Value != nil && *controllerPanicMetric.Counter.Value > 0 {
+					controllerName := "unknown"
+					for _, label := range controllerPanicMetric.Label {
+						if *label.Name == "controller" {
+							controllerName = *label.Value
+						}
+					}
+					errs = append(errs, fmt.Errorf("%.0f panics occurred in %q controller (check logs for more details)", *controllerPanicMetric.Counter.Value, controllerName))
+				}
+			}
+		}
+
+		if metricFamily.GetName() == "controller_runtime_webhook_panics_total" {
+			for _, webhookPanicMetric := range metricFamily.Metric {
+				if webhookPanicMetric.Counter != nil && webhookPanicMetric.Counter.Value != nil && *webhookPanicMetric.Counter.Value > 0 {
+					errs = append(errs, fmt.Errorf("%.0f panics occurred in webhooks (check logs for more details)", *webhookPanicMetric.Counter.Value))
+				}
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return kerrors.NewAggregate(errs)
+	}
+
+	return nil
 }

@@ -29,6 +29,10 @@ const (
 	// MachineSetTopologyFinalizer is the finalizer used by the topology MachineDeployment controller to
 	// clean up referenced template resources if necessary when a MachineSet is being deleted.
 	MachineSetTopologyFinalizer = "machineset.topology.cluster.x-k8s.io"
+
+	// MachineSetFinalizer is the finalizer used by the MachineSet controller to
+	// ensure ordered cleanup of corresponding Machines when a Machineset is being deleted.
+	MachineSetFinalizer = "cluster.x-k8s.io/machineset"
 )
 
 // ANCHOR: MachineSetSpec
@@ -82,6 +86,81 @@ type MachineSetSpec struct {
 	// +optional
 	Template MachineTemplateSpec `json:"template,omitempty"`
 }
+
+// MachineSet's ScalingUp condition and corresponding reasons that will be used in v1Beta2 API version.
+const (
+	// MachineSetScalingUpV1Beta2Condition is true if actual replicas < desired replicas.
+	MachineSetScalingUpV1Beta2Condition = ScalingUpV1Beta2Condition
+
+	// MachineSetScalingUpV1Beta2Reason surfaces when actual replicas < desired replicas.
+	MachineSetScalingUpV1Beta2Reason = ScalingUpV1Beta2Reason
+
+	// MachineSetNotScalingUpV1Beta2Reason surfaces when actual replicas >= desired replicas.
+	MachineSetNotScalingUpV1Beta2Reason = NotScalingUpV1Beta2Reason
+
+	// MachineSetScalingUpInternalErrorV1Beta2Reason surfaces unexpected failures when listing machines.
+	MachineSetScalingUpInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
+
+	// MachineSetScalingUpWaitingForReplicasSetV1Beta2Reason surfaces when the .spec.replicas
+	// field of the MachineSet is not set.
+	MachineSetScalingUpWaitingForReplicasSetV1Beta2Reason = WaitingForReplicasSetV1Beta2Reason
+)
+
+// MachineSet's ScalingDown condition and corresponding reasons that will be used in v1Beta2 API version.
+const (
+	// MachineSetScalingDownV1Beta2Condition is true if actual replicas > desired replicas.
+	MachineSetScalingDownV1Beta2Condition = ScalingDownV1Beta2Condition
+
+	// MachineSetScalingDownV1Beta2Reason surfaces when actual replicas > desired replicas.
+	MachineSetScalingDownV1Beta2Reason = ScalingDownV1Beta2Reason
+
+	// MachineSetNotScalingDownV1Beta2Reason surfaces when actual replicas <= desired replicas.
+	MachineSetNotScalingDownV1Beta2Reason = NotScalingDownV1Beta2Reason
+
+	// MachineSetScalingDownInternalErrorV1Beta2Reason surfaces unexpected failures when listing machines.
+	MachineSetScalingDownInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
+
+	// MachineSetScalingDownWaitingForReplicasSetV1Beta2Reason surfaces when the .spec.replicas
+	// field of the MachineSet is not set.
+	MachineSetScalingDownWaitingForReplicasSetV1Beta2Reason = WaitingForReplicasSetV1Beta2Reason
+)
+
+// MachineSet's MachinesReady condition and corresponding reasons that will be used in v1Beta2 API version.
+// Note: Reason's could also be derived from the aggregation of machine's Ready conditions.
+const (
+	// MachineSetMachinesReadyV1Beta2Condition surfaces detail of issues on the controlled machines, if any.
+	MachineSetMachinesReadyV1Beta2Condition = MachinesReadyV1Beta2Condition
+
+	// MachineSetMachinesReadyNoReplicasV1Beta2Reason surfaces when no machines exist for the MachineSet.
+	MachineSetMachinesReadyNoReplicasV1Beta2Reason = NoReplicasV1Beta2Reason
+
+	// MachineSetMachinesReadyInternalErrorV1Beta2Reason surfaces unexpected failures when listing machines
+	// or aggregating machine's conditions.
+	MachineSetMachinesReadyInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
+)
+
+// MachineSet's MachinesUpToDate condition and corresponding reasons that will be used in v1Beta2 API version.
+// Note: Reason's could also be derived from the aggregation of machine's MachinesUpToDate conditions.
+const (
+	// MachineSetMachinesUpToDateV1Beta2Condition surfaces details of controlled machines not up to date, if any.
+	MachineSetMachinesUpToDateV1Beta2Condition = MachinesUpToDateV1Beta2Condition
+
+	// MachineSetMachinesUpToDateNoReplicasV1Beta2Reason surfaces when no machines exist for the MachineSet.
+	MachineSetMachinesUpToDateNoReplicasV1Beta2Reason = NoReplicasV1Beta2Reason
+
+	// MachineSetMachinesUpToDateInternalErrorV1Beta2Reason surfaces unexpected failures when listing machines
+	// or aggregating status.
+	MachineSetMachinesUpToDateInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
+)
+
+// Conditions that will be used for the MachineSet object in v1Beta2 API version.
+const (
+	// MachineSetRemediatingV1Beta2Condition surfaces details about ongoing remediation of the controlled machines, if any.
+	MachineSetRemediatingV1Beta2Condition = RemediatingV1Beta2Condition
+
+	// MachineSetDeletingV1Beta2Condition surfaces details about ongoing deletion of the controlled machines.
+	MachineSetDeletingV1Beta2Condition = DeletingV1Beta2Condition
+)
 
 // ANCHOR_END: MachineSetSpec
 
@@ -177,13 +256,46 @@ type MachineSetStatus struct {
 	// Any transient errors that occur during the reconciliation of Machines
 	// can be added as events to the MachineSet object and/or logged in the
 	// controller's output.
+	//
+	// Deprecated: This field is deprecated and is going to be removed in the next apiVersion. Please see https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more details.
+	//
 	// +optional
 	FailureReason *capierrors.MachineSetStatusError `json:"failureReason,omitempty"`
+	// Deprecated: This field is deprecated and is going to be removed in the next apiVersion. Please see https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more details.
+	//
 	// +optional
 	FailureMessage *string `json:"failureMessage,omitempty"`
 	// Conditions defines current service state of the MachineSet.
 	// +optional
 	Conditions Conditions `json:"conditions,omitempty"`
+
+	// v1beta2 groups all the fields that will be added or modified in MachineSet's status with the V1Beta2 version.
+	// +optional
+	V1Beta2 *MachineSetV1Beta2Status `json:"v1beta2,omitempty"`
+}
+
+// MachineSetV1Beta2Status groups all the fields that will be added or modified in MachineSetStatus with the V1Beta2 version.
+// See https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more context.
+type MachineSetV1Beta2Status struct {
+	// conditions represents the observations of a MachineSet's current state.
+	// Known condition types are MachinesReady, MachinesUpToDate, ScalingUp, ScalingDown, Remediating, Deleting, Paused.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=32
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// readyReplicas is the number of ready replicas for this MachineSet. A machine is considered ready when Machine's Ready condition is true.
+	// +optional
+	ReadyReplicas *int32 `json:"readyReplicas,omitempty"`
+
+	// availableReplicas is the number of available replicas for this MachineSet. A machine is considered available when Machine's Available condition is true.
+	// +optional
+	AvailableReplicas *int32 `json:"availableReplicas,omitempty"`
+
+	// upToDateReplicas is the number of up-to-date replicas for this MachineSet. A machine is considered up-to-date when Machine's UpToDate condition is true.
+	// +optional
+	UpToDateReplicas *int32 `json:"upToDateReplicas,omitempty"`
 }
 
 // ANCHOR_END: MachineSetStatus
@@ -241,6 +353,22 @@ func (m *MachineSet) GetConditions() Conditions {
 // SetConditions updates the set of conditions on the MachineSet.
 func (m *MachineSet) SetConditions(conditions Conditions) {
 	m.Status.Conditions = conditions
+}
+
+// GetV1Beta2Conditions returns the set of conditions for this object.
+func (m *MachineSet) GetV1Beta2Conditions() []metav1.Condition {
+	if m.Status.V1Beta2 == nil {
+		return nil
+	}
+	return m.Status.V1Beta2.Conditions
+}
+
+// SetV1Beta2Conditions sets conditions for an API object.
+func (m *MachineSet) SetV1Beta2Conditions(conditions []metav1.Condition) {
+	if m.Status.V1Beta2 == nil && conditions != nil {
+		m.Status.V1Beta2 = &MachineSetV1Beta2Status{}
+	}
+	m.Status.V1Beta2.Conditions = conditions
 }
 
 // +kubebuilder:object:root=true

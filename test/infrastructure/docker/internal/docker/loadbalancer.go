@@ -65,7 +65,10 @@ func NewLoadBalancer(ctx context.Context, cluster *clusterv1.Cluster, dockerClus
 		return nil, err
 	}
 
-	ipFamily, err := cluster.GetIPFamily()
+	// We tolerate this until removal;
+	// after removal IPFamily will become an internal CAPD concept.
+	// See https://github.com/kubernetes-sigs/cluster-api/issues/7521.
+	ipFamily, err := cluster.GetIPFamily() //nolint:staticcheck
 	if err != nil {
 		return nil, fmt.Errorf("create load balancer: %s", err)
 	}
@@ -189,6 +192,17 @@ func (s *LoadBalancer) UpdateConfiguration(ctx context.Context, unsafeLoadBalanc
 	log.Info("Updating load balancer configuration")
 	if err := s.container.WriteFile(ctx, loadbalancer.ConfigPath, loadBalancerConfig); err != nil {
 		return errors.WithStack(err)
+	}
+
+	// Read back the load balancer configuration to ensure it got written before
+	// signaling haproxy to reload the config file.
+	// This is a workaround to fix https://github.com/kubernetes-sigs/cluster-api/issues/10356
+	readLoadBalancerConfig, err := s.container.ReadFile(ctx, loadbalancer.ConfigPath)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if string(readLoadBalancerConfig) != loadBalancerConfig {
+		return fmt.Errorf("read load balancer configuration does not match written file")
 	}
 
 	return errors.WithStack(s.container.Kill(ctx, "SIGHUP"))

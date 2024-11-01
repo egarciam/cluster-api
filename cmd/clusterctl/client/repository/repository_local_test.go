@@ -29,6 +29,10 @@ import (
 	"sigs.k8s.io/cluster-api/cmd/clusterctl/internal/test"
 )
 
+const (
+	metadataContents = "apiVersion: clusterctl.cluster.x-k8s.io/v1alpha3\nreleaseSeries:\n  - major: 0\n    minor: 4\n    contract: v1alpha4\n  - major: 0\n    minor: 5\n    contract: v1alpha4\n  - major: 0\n    minor: 3\n    contract: v1alpha3\n"
+)
+
 func Test_localRepository_newLocalRepository(t *testing.T) {
 	type fields struct {
 		provider              config.Provider
@@ -125,16 +129,6 @@ func Test_localRepository_newLocalRepository(t *testing.T) {
 	}
 }
 
-func createTempDir(t *testing.T) string {
-	t.Helper()
-
-	dir, err := os.MkdirTemp("", "cc")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	return dir
-}
-
 func createLocalTestProviderFile(t *testing.T, tmpDir, path, msg string) string {
 	t.Helper()
 
@@ -151,12 +145,12 @@ func createLocalTestProviderFile(t *testing.T, tmpDir, path, msg string) string 
 func Test_localRepository_newLocalRepository_Latest(t *testing.T) {
 	g := NewWithT(t)
 
-	tmpDir := createTempDir(t)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Create several release directories
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/v1.0.0/bootstrap-components.yaml", "foo: bar")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/v1.0.1/bootstrap-components.yaml", "foo: bar")
+	createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/v1.0.1/metadata.yaml", metadataContents)
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/v2.0.0-alpha.0/bootstrap-components.yaml", "foo: bar")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/Foo.Bar/bootstrap-components.yaml", "foo: bar")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/foo.file", "foo: bar")
@@ -177,16 +171,17 @@ func Test_localRepository_newLocalRepository_Latest(t *testing.T) {
 }
 
 func Test_localRepository_GetFile(t *testing.T) {
-	tmpDir := createTempDir(t)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Provider 1: URL is for the only release available
 	dst1 := createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/v1.0.0/bootstrap-components.yaml", "foo: bar")
 	p1 := config.NewProvider("foo", dst1, clusterctlv1.BootstrapProviderType)
 
 	// Provider 2: URL is for the latest release
+	createLocalTestProviderFile(t, tmpDir, "bootstrap-baz/v1.0.0-alpha.0/metadata.yaml", metadataContents)
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v1.0.0/bootstrap-components.yaml", "version: v1.0.0")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v1.0.1/bootstrap-components.yaml", "version: v1.0.1")
+	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v1.0.1/metadata.yaml", metadataContents)
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v2.0.0-alpha.0/bootstrap-components.yaml", "version: v2.0.0-alpha.0")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/Foo.Bar/bootstrap-components.yaml", "version: Foo.Bar")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/foo.file", "foo: bar")
@@ -312,8 +307,7 @@ func Test_localRepository_GetFile(t *testing.T) {
 }
 
 func Test_localRepository_GetVersions(t *testing.T) {
-	tmpDir := createTempDir(t)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Provider 1: has a single release available
 	dst1 := createLocalTestProviderFile(t, tmpDir, "bootstrap-foo/v1.0.0/bootstrap-components.yaml", "foo: bar")
@@ -323,6 +317,7 @@ func Test_localRepository_GetVersions(t *testing.T) {
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v1.0.0/bootstrap-components.yaml", "version: v1.0.0")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v1.0.1/bootstrap-components.yaml", "version: v1.0.1")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v2.0.1/bootstrap-components.yaml", "version: v2.0.1")
+	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v2.0.2+exp.sha.5114f85/metadata.yaml", metadataContents)
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v2.0.2+exp.sha.5114f85/bootstrap-components.yaml", "version: v2.0.2+exp.sha.5114f85")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/v2.0.3-alpha/bootstrap-components.yaml", "version: v2.0.3-alpha")
 	createLocalTestProviderFile(t, tmpDir, "bootstrap-bar/Foo.Bar/bootstrap-components.yaml", "version: Foo.Bar")

@@ -52,7 +52,6 @@ import (
 	"sigs.k8s.io/cluster-api/util/certs"
 	containerutil "sigs.k8s.io/cluster-api/util/container"
 	"sigs.k8s.io/cluster-api/util/patch"
-	"sigs.k8s.io/cluster-api/util/version"
 )
 
 const (
@@ -68,23 +67,18 @@ const (
 )
 
 var (
-	// Starting from v1.22.0 kubeadm dropped the usage of the ClusterStatus entry from the kubeadm-config ConfigMap
-	// so we're not anymore required to remove API endpoints for control plane nodes after deletion.
-	//
-	// NOTE: The following assumes that kubeadm version equals to Kubernetes version.
-	minKubernetesVersionWithoutClusterStatus = semver.MustParse("1.22.0")
-
-	// Starting from v1.21.0 kubeadm defaults to systemdCGroup driver, as well as images built with ImageBuilder,
-	// so it is necessary to mutate the kubelet-config-xx ConfigMap.
-	//
-	// NOTE: The following assumes that kubeadm version equals to Kubernetes version.
-	minVerKubeletSystemdDriver = semver.MustParse("1.21.0")
-
 	// Starting from v1.24.0 kubeadm uses "kubelet-config" a ConfigMap name for KubeletConfiguration,
 	// Dropping the X-Y suffix.
 	//
 	// NOTE: The following assumes that kubeadm version equals to Kubernetes version.
 	minVerUnversionedKubeletConfig = semver.MustParse("1.24.0")
+
+	// minKubernetesVersionControlPlaneKubeletLocalMode is the min version from which
+	// we will enable the ControlPlaneKubeletLocalMode kubeadm feature gate.
+	// Note: We have to do this with Kubernetes 1.31. Because with that version we encountered
+	// a case where it's not okay anymore to ignore the Kubernetes version skew (kubelet 1.31 uses
+	// the spec.clusterIP field selector that is only implemented in kube-apiserver >= 1.31.0).
+	minKubernetesVersionControlPlaneKubeletLocalMode = semver.MustParse("1.31.0")
 
 	// ErrControlPlaneMinNodes signals that a cluster doesn't meet the minimum required nodes
 	// to remove an etcd member.
@@ -107,7 +101,7 @@ type WorkloadCluster interface {
 	ReconcileKubeletRBACRole(ctx context.Context, version semver.Version) error
 	UpdateKubernetesVersionInKubeadmConfigMap(version semver.Version) func(*bootstrapv1.ClusterConfiguration)
 	UpdateImageRepositoryInKubeadmConfigMap(imageRepository string) func(*bootstrapv1.ClusterConfiguration)
-	UpdateFeatureGatesInKubeadmConfigMap(featureGates map[string]bool) func(*bootstrapv1.ClusterConfiguration)
+	UpdateFeatureGatesInKubeadmConfigMap(kubeadmConfigSpec bootstrapv1.KubeadmConfigSpec, kubernetesVersion semver.Version) func(*bootstrapv1.ClusterConfiguration)
 	UpdateEtcdLocalInKubeadmConfigMap(localEtcd *bootstrapv1.LocalEtcd) func(*bootstrapv1.ClusterConfiguration)
 	UpdateEtcdExternalInKubeadmConfigMap(externalEtcd *bootstrapv1.ExternalEtcd) func(*bootstrapv1.ClusterConfiguration)
 	UpdateAPIServerInKubeadmConfigMap(apiServer bootstrapv1.APIServer) func(*bootstrapv1.ClusterConfiguration)
@@ -117,15 +111,13 @@ type WorkloadCluster interface {
 	UpdateKubeProxyImageInfo(ctx context.Context, kcp *controlplanev1.KubeadmControlPlane, version semver.Version) error
 	UpdateCoreDNS(ctx context.Context, kcp *controlplanev1.KubeadmControlPlane, version semver.Version) error
 	RemoveEtcdMemberForMachine(ctx context.Context, machine *clusterv1.Machine) error
-	RemoveMachineFromKubeadmConfigMap(ctx context.Context, machine *clusterv1.Machine, version semver.Version) error
-	RemoveNodeFromKubeadmConfigMap(ctx context.Context, nodeName string, version semver.Version) error
 	ForwardEtcdLeadership(ctx context.Context, machine *clusterv1.Machine, leaderCandidate *clusterv1.Machine) error
 	AllowBootstrapTokensToGetNodes(ctx context.Context) error
 	AllowClusterAdminPermissions(ctx context.Context, version semver.Version) error
 	UpdateClusterConfiguration(ctx context.Context, version semver.Version, mutators ...func(*bootstrapv1.ClusterConfiguration)) error
 
 	// State recovery tasks.
-	ReconcileEtcdMembers(ctx context.Context, nodeNames []string, version semver.Version) ([]string, error)
+	ReconcileEtcdMembers(ctx context.Context, nodeNames []string) ([]string, error)
 }
 
 // Workload defines operations on workload clusters.
@@ -186,11 +178,40 @@ func (w *Workload) UpdateImageRepositoryInKubeadmConfigMap(imageRepository strin
 }
 
 // UpdateFeatureGatesInKubeadmConfigMap updates the feature gates in the kubeadm config map.
-func (w *Workload) UpdateFeatureGatesInKubeadmConfigMap(featureGates map[string]bool) func(*bootstrapv1.ClusterConfiguration) {
+func (w *Workload) UpdateFeatureGatesInKubeadmConfigMap(kubeadmConfigSpec bootstrapv1.KubeadmConfigSpec, kubernetesVersion semver.Version) func(*bootstrapv1.ClusterConfiguration) {
 	return func(c *bootstrapv1.ClusterConfiguration) {
+		// We use DeepCopy here to avoid modifying the KCP object in the apiserver.
+		kubeadmConfigSpec := kubeadmConfigSpec.DeepCopy()
+		DefaultFeatureGates(kubeadmConfigSpec, kubernetesVersion)
+
 		// Even if featureGates is nil, reset it to ClusterConfiguration
 		// to override any previously set feature gates.
-		c.FeatureGates = featureGates
+		c.FeatureGates = kubeadmConfigSpec.ClusterConfiguration.FeatureGates
+	}
+}
+
+const (
+	// ControlPlaneKubeletLocalMode is a feature gate of kubeadm that ensures
+	// kubelets only communicate with the local apiserver.
+	ControlPlaneKubeletLocalMode = "ControlPlaneKubeletLocalMode"
+)
+
+// DefaultFeatureGates defaults the feature gates field.
+func DefaultFeatureGates(kubeadmConfigSpec *bootstrapv1.KubeadmConfigSpec, kubernetesVersion semver.Version) {
+	if kubernetesVersion.LT(minKubernetesVersionControlPlaneKubeletLocalMode) {
+		return
+	}
+
+	if kubeadmConfigSpec.ClusterConfiguration == nil {
+		kubeadmConfigSpec.ClusterConfiguration = &bootstrapv1.ClusterConfiguration{}
+	}
+
+	if kubeadmConfigSpec.ClusterConfiguration.FeatureGates == nil {
+		kubeadmConfigSpec.ClusterConfiguration.FeatureGates = map[string]bool{}
+	}
+
+	if _, ok := kubeadmConfigSpec.ClusterConfiguration.FeatureGates[ControlPlaneKubeletLocalMode]; !ok {
+		kubeadmConfigSpec.ClusterConfiguration.FeatureGates[ControlPlaneKubeletLocalMode] = true
 	}
 }
 
@@ -241,33 +262,31 @@ func (w *Workload) UpdateKubeletConfigMap(ctx context.Context, version semver.Ve
 	// NOTE: It is considered safe to update the kubelet-config-1.21 ConfigMap
 	// because only new nodes using v1.21 images will pick up the change during
 	// kubeadm join.
-	if version.GE(minVerKubeletSystemdDriver) {
-		data, ok := cm.Data[kubeletConfigKey]
-		if !ok {
-			return errors.Errorf("unable to find %q key in %s", kubeletConfigKey, cm.Name)
-		}
-		kubeletConfig, err := yamlToUnstructured([]byte(data))
-		if err != nil {
-			return errors.Wrapf(err, "unable to decode kubelet ConfigMap's %q content to Unstructured object", kubeletConfigKey)
-		}
-		cgroupDriver, _, err := unstructured.NestedString(kubeletConfig.UnstructuredContent(), cgroupDriverKey)
-		if err != nil {
-			return errors.Wrapf(err, "unable to extract %q from Kubelet ConfigMap's %q", cgroupDriverKey, cm.Name)
-		}
+	data, ok := cm.Data[kubeletConfigKey]
+	if !ok {
+		return errors.Errorf("unable to find %q key in %s", kubeletConfigKey, cm.Name)
+	}
+	kubeletConfig, err := yamlToUnstructured([]byte(data))
+	if err != nil {
+		return errors.Wrapf(err, "unable to decode kubelet ConfigMap's %q content to Unstructured object", kubeletConfigKey)
+	}
+	cgroupDriver, _, err := unstructured.NestedString(kubeletConfig.UnstructuredContent(), cgroupDriverKey)
+	if err != nil {
+		return errors.Wrapf(err, "unable to extract %q from Kubelet ConfigMap's %q", cgroupDriverKey, cm.Name)
+	}
 
-		// If the value is not already explicitly set by the user, change according to kubeadm/image builder new requirements.
-		if cgroupDriver == "" {
-			cgroupDriver = "systemd"
+	// If the value is not already explicitly set by the user, change according to kubeadm/image builder new requirements.
+	if cgroupDriver == "" {
+		cgroupDriver = "systemd"
 
-			if err := unstructured.SetNestedField(kubeletConfig.UnstructuredContent(), cgroupDriver, cgroupDriverKey); err != nil {
-				return errors.Wrapf(err, "unable to update %q on Kubelet ConfigMap's %q", cgroupDriverKey, cm.Name)
-			}
-			updated, err := yaml.Marshal(kubeletConfig)
-			if err != nil {
-				return errors.Wrapf(err, "unable to encode Kubelet ConfigMap's %q to YAML", cm.Name)
-			}
-			cm.Data[kubeletConfigKey] = string(updated)
+		if err := unstructured.SetNestedField(kubeletConfig.UnstructuredContent(), cgroupDriver, cgroupDriverKey); err != nil {
+			return errors.Wrapf(err, "unable to update %q on Kubelet ConfigMap's %q", cgroupDriverKey, cm.Name)
 		}
+		updated, err := yaml.Marshal(kubeletConfig)
+		if err != nil {
+			return errors.Wrapf(err, "unable to encode Kubelet ConfigMap's %q to YAML", cm.Name)
+		}
+		cm.Data[kubeletConfigKey] = string(updated)
 	}
 
 	// Update the name to the new name
@@ -300,27 +319,6 @@ func (w *Workload) UpdateSchedulerInKubeadmConfigMap(scheduler bootstrapv1.Contr
 	return func(c *bootstrapv1.ClusterConfiguration) {
 		c.Scheduler = scheduler
 	}
-}
-
-// RemoveMachineFromKubeadmConfigMap removes the entry for the machine from the kubeadm configmap.
-func (w *Workload) RemoveMachineFromKubeadmConfigMap(ctx context.Context, machine *clusterv1.Machine, version semver.Version) error {
-	if machine == nil || machine.Status.NodeRef == nil {
-		// Nothing to do, no node for Machine
-		return nil
-	}
-
-	return w.RemoveNodeFromKubeadmConfigMap(ctx, machine.Status.NodeRef.Name, version)
-}
-
-// RemoveNodeFromKubeadmConfigMap removes the entry for the node from the kubeadm configmap.
-func (w *Workload) RemoveNodeFromKubeadmConfigMap(ctx context.Context, name string, v semver.Version) error {
-	if version.Compare(v, minKubernetesVersionWithoutClusterStatus, version.WithoutPreReleases()) >= 0 {
-		return nil
-	}
-
-	return w.updateClusterStatus(ctx, func(s *bootstrapv1.ClusterStatus) {
-		delete(s.APIEndpoints, name)
-	}, v)
 }
 
 // updateClusterStatus gets the ClusterStatus kubeadm-config ConfigMap, converts it to the

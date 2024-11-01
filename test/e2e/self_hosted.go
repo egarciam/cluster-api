@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -132,7 +133,7 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 		}
 
 		// Setup a Namespace where to host objects for this spec and create a watcher for the namespace events.
-		namespace, cancelWatches = setupSpecNamespace(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, input.PostNamespaceCreated)
+		namespace, cancelWatches = framework.SetupSpecNamespace(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, input.PostNamespaceCreated)
 		clusterResources = new(clusterctl.ApplyClusterTemplateAndWaitResult)
 
 		if input.ControlPlaneMachineCount == nil {
@@ -296,20 +297,35 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 		})
 		Expect(controlPlane).ToNot(BeNil())
 
-		// After the move check that there were no unexpected rollouts.
+		// After the move: wait for MachineList to be available after the upgrade.
 		log.Logf("Verify there are no unexpected rollouts")
-		Consistently(func() bool {
+		Eventually(func() error {
 			postMoveMachineList := &unstructured.UnstructuredList{}
 			postMoveMachineList.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineList"))
-			err = selfHostedClusterProxy.GetClient().List(
+			return selfHostedClusterProxy.GetClient().List(
 				ctx,
 				postMoveMachineList,
 				client.InNamespace(namespace.Name),
 				client.MatchingLabels{clusterv1.ClusterNameLabel: workloadClusterName},
 			)
-			Expect(err).NotTo(HaveOccurred(), "Failed to list machines after move")
-			return validateMachineRollout(preMoveMachineList, postMoveMachineList)
-		}, "3m", "30s").Should(BeTrue(), "Machines should not roll out after move to self-hosted cluster")
+		}, "3m", "30s").ShouldNot(HaveOccurred(), "MachineList should be available after move to self-hosted cluster")
+
+		log.Logf("Waiting for three minutes before checking if an unexpected rollout happened")
+		time.Sleep(time.Minute * 3)
+
+		// After the move: check that there were no unexpected rollouts.
+		postMoveMachineList := &unstructured.UnstructuredList{}
+		log.Logf("Verify there are no unexpected rollouts")
+		Eventually(func() error {
+			postMoveMachineList.SetGroupVersionKind(clusterv1.GroupVersion.WithKind("MachineList"))
+			return selfHostedClusterProxy.GetClient().List(
+				ctx,
+				postMoveMachineList,
+				client.InNamespace(namespace.Name),
+				client.MatchingLabels{clusterv1.ClusterNameLabel: workloadClusterName},
+			)
+		}, "3m", "30s").ShouldNot(HaveOccurred(), "MachineList should be available after move to self-hosted cluster")
+		Expect(validateMachineRollout(preMoveMachineList, postMoveMachineList)).To(BeTrue(), "Machines should not roll out after move to self-hosted cluster")
 
 		if input.SkipUpgrade {
 			// Only do upgrade step if defined by test input.
@@ -412,7 +428,7 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 	AfterEach(func() {
 		if selfHostedNamespace != nil {
 			// Dump all Cluster API related resources to artifacts before pivoting back.
-			dumpAllResources(ctx, selfHostedClusterProxy, input.ArtifactFolder, namespace, clusterResources.Cluster)
+			framework.DumpAllResourcesAndLogs(ctx, selfHostedClusterProxy, input.ArtifactFolder, namespace, clusterResources.Cluster)
 		}
 		if selfHostedCluster != nil {
 			By("Ensure API servers are stable before doing move")
@@ -449,7 +465,7 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 		}
 
 		// Dumps all the resources in the spec namespace, then cleanups the cluster object and the spec namespace itself.
-		dumpSpecResourcesAndCleanup(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, namespace, cancelWatches, clusterResources.Cluster, input.E2EConfig.GetIntervals, input.SkipCleanup)
+		framework.DumpSpecResourcesAndCleanup(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, namespace, cancelWatches, clusterResources.Cluster, input.E2EConfig.GetIntervals, input.SkipCleanup)
 	})
 }
 

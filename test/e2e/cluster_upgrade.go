@@ -66,6 +66,10 @@ type ClusterUpgradeConformanceSpecInput struct {
 	// Allows to inject a function to be run after test namespace is created.
 	// If not specified, this is a no-op.
 	PostNamespaceCreated func(managementClusterProxy framework.ClusterProxy, workloadClusterNamespace string)
+
+	// Allows to inject a function to be run before checking control-plane machines to be upgraded.
+	// If not specified, this is a no-op.
+	PreWaitForControlPlaneToBeUpgraded func(managementClusterProxy framework.ClusterProxy, workloadClusterNamespace, workloadClusterName string)
 }
 
 // ClusterUpgradeConformanceSpec implements a spec that upgrades a cluster and runs the Kubernetes conformance suite.
@@ -93,6 +97,8 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 
 		clusterResources       *clusterctl.ApplyClusterTemplateAndWaitResult
 		kubetestConfigFilePath string
+
+		clusterName string
 	)
 
 	BeforeEach(func() {
@@ -130,7 +136,7 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 		}
 
 		// Setup a Namespace where to host objects for this spec and create a watcher for the Namespace events.
-		namespace, cancelWatches = setupSpecNamespace(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, input.PostNamespaceCreated)
+		namespace, cancelWatches = framework.SetupSpecNamespace(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, input.PostNamespaceCreated)
 		clusterResources = new(clusterctl.ApplyClusterTemplateAndWaitResult)
 	})
 
@@ -142,6 +148,8 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 			infrastructureProvider = *input.InfrastructureProvider
 		}
 
+		clusterName = fmt.Sprintf("%s-%s", specName, util.RandomString(6))
+
 		clusterctl.ApplyClusterTemplateAndWait(ctx, clusterctl.ApplyClusterTemplateAndWaitInput{
 			ClusterProxy: input.BootstrapClusterProxy,
 			ConfigCluster: clusterctl.ConfigClusterInput{
@@ -151,7 +159,7 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 				InfrastructureProvider:   infrastructureProvider,
 				Flavor:                   ptr.Deref(input.Flavor, "upgrades"),
 				Namespace:                namespace.Name,
-				ClusterName:              fmt.Sprintf("%s-%s", specName, util.RandomString(6)),
+				ClusterName:              clusterName,
 				KubernetesVersion:        input.E2EConfig.GetVariable(KubernetesVersionUpgradeFrom),
 				ControlPlaneMachineCount: ptr.To[int64](controlPlaneMachineCount),
 				WorkerMachineCount:       ptr.To[int64](workerMachineCount),
@@ -180,6 +188,11 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 				WaitForKubeProxyUpgrade:        input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
 				WaitForDNSUpgrade:              input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
 				WaitForEtcdUpgrade:             input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+				PreWaitForControlPlaneToBeUpgraded: func() {
+					if input.PreWaitForControlPlaneToBeUpgraded != nil {
+						input.PreWaitForControlPlaneToBeUpgraded(input.BootstrapClusterProxy, namespace.Name, clusterName)
+					}
+				},
 			})
 		} else {
 			// Cluster is not using ClusterClass, upgrade via individual resources.
@@ -209,6 +222,11 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 				WaitForKubeProxyUpgrade:     input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
 				WaitForDNSUpgrade:           input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
 				WaitForEtcdUpgrade:          input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+				PreWaitForControlPlaneToBeUpgraded: func() {
+					if input.PreWaitForControlPlaneToBeUpgraded != nil {
+						input.PreWaitForControlPlaneToBeUpgraded(input.BootstrapClusterProxy, namespace.Name, clusterName)
+					}
+				},
 			})
 
 			if workerMachineCount > 0 {
@@ -256,6 +274,7 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 					ArtifactsDirectory: input.ArtifactFolder,
 					ConfigFilePath:     kubetestConfigFilePath,
 					GinkgoNodes:        int(clusterResources.ExpectedWorkerNodes()),
+					ClusterName:        clusterResources.Cluster.GetName(),
 				},
 			)
 			Expect(err).ToNot(HaveOccurred(), "Failed to run Kubernetes conformance")
@@ -266,6 +285,6 @@ func ClusterUpgradeConformanceSpec(ctx context.Context, inputGetter func() Clust
 
 	AfterEach(func() {
 		// Dumps all the resources in the spec Namespace, then cleanups the cluster object and the spec Namespace itself.
-		dumpSpecResourcesAndCleanup(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, namespace, cancelWatches, clusterResources.Cluster, input.E2EConfig.GetIntervals, input.SkipCleanup)
+		framework.DumpSpecResourcesAndCleanup(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, namespace, cancelWatches, clusterResources.Cluster, input.E2EConfig.GetIntervals, input.SkipCleanup)
 	})
 }

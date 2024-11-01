@@ -20,9 +20,9 @@ import (
 	"context"
 
 	"github.com/spf13/cobra"
-	"k8s.io/kubectl/pkg/util/templates"
 
 	"sigs.k8s.io/cluster-api/cmd/clusterctl/client"
+	"sigs.k8s.io/cluster-api/cmd/clusterctl/cmd/internal/templates"
 )
 
 // undoOptions is the start of the data required to perform the operation.
@@ -66,6 +66,8 @@ func NewCmdRolloutUndo(cfgFile string) *cobra.Command {
 		"Context to be used within the kubeconfig file. If empty, current context will be used.")
 	cmd.Flags().StringVarP(&undoOpt.namespace, "namespace", "n", "", "Namespace where the resource(s) reside. If unspecified, the defult namespace will be used.")
 	cmd.Flags().Int64Var(&undoOpt.toRevision, "to-revision", undoOpt.toRevision, "The revision to rollback to. Default to 0 (last revision).")
+
+	cmd.Deprecated = "it will be removed in one of the upcoming releases.\n"
 
 	return cmd
 }

@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/controllers/remote"
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/feature"
@@ -80,15 +81,18 @@ var (
 	syncPeriod                  time.Duration
 	restConfigQPS               float32
 	restConfigBurst             int
+	clusterCacheClientQPS       float32
+	clusterCacheClientBurst     int
 	webhookPort                 int
 	webhookCertDir              string
+	webhookCertName             string
+	webhookKeyName              string
 	healthAddr                  string
-	tlsOptions                  = flags.TLSOptions{}
-	diagnosticsOptions          = flags.DiagnosticsOptions{}
+	managerOptions              = flags.ManagerOptions{}
 	logOptions                  = logs.NewOptions()
 	// CAPD specific flags.
-	concurrency                    int
-	clusterCacheTrackerConcurrency int
+	concurrency             int
+	clusterCacheConcurrency int
 )
 
 func init() {
@@ -134,29 +138,40 @@ func InitFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&concurrency, "concurrency", 10,
 		"The number of docker machines to process simultaneously")
 
-	fs.IntVar(&clusterCacheTrackerConcurrency, "clustercachetracker-concurrency", 10,
+	fs.IntVar(&clusterCacheConcurrency, "clustercache-concurrency", 100,
 		"Number of clusters to process simultaneously")
 
 	fs.DurationVar(&syncPeriod, "sync-period", 10*time.Minute,
 		"The minimum interval at which watched resources are reconciled (e.g. 15m)")
 
 	fs.Float32Var(&restConfigQPS, "kube-api-qps", 20,
-		"Maximum queries per second from the controller client to the Kubernetes API server. Defaults to 20")
+		"Maximum queries per second from the controller client to the Kubernetes API server.")
 
 	fs.IntVar(&restConfigBurst, "kube-api-burst", 30,
-		"Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server. Default 30")
+		"Maximum number of queries that should be allowed in one burst from the controller client to the Kubernetes API server.")
+
+	fs.Float32Var(&clusterCacheClientQPS, "clustercache-client-qps", 20,
+		"Maximum queries per second from the cluster cache clients to the Kubernetes API server of workload clusters.")
+
+	fs.IntVar(&clusterCacheClientBurst, "clustercache-client-burst", 30,
+		"Maximum number of queries that should be allowed in one burst from the cluster cache clients to the Kubernetes API server of workload clusters.")
 
 	fs.IntVar(&webhookPort, "webhook-port", 9443,
 		"Webhook Server port")
 
 	fs.StringVar(&webhookCertDir, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs/",
-		"Webhook cert dir, only used when webhook-port is specified.")
+		"Webhook cert dir.")
+
+	fs.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt",
+		"Webhook cert name.")
+
+	fs.StringVar(&webhookKeyName, "webhook-key-name", "tls.key",
+		"Webhook key name.")
 
 	fs.StringVar(&healthAddr, "health-addr", ":9440",
 		"The address the health endpoint binds to.")
 
-	flags.AddDiagnosticsOptions(fs, &diagnosticsOptions)
-	flags.AddTLSOptions(fs, &tlsOptions)
+	flags.AddManagerOptions(fs, &managerOptions)
 
 	feature.MutableGates.AddFlag(fs)
 }
@@ -167,7 +182,7 @@ func InitFlags(fs *pflag.FlagSet) {
 
 func main() {
 	if _, err := os.ReadDir("/tmp/"); err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLog.Error(err, "Unable to start manager")
 		os.Exit(1)
 	}
 
@@ -176,13 +191,13 @@ func main() {
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	// Set log level 2 as default.
 	if err := pflag.CommandLine.Set("v", "2"); err != nil {
-		setupLog.Error(err, "failed to set default log level")
+		setupLog.Error(err, "Failed to set default log level")
 		os.Exit(1)
 	}
 	pflag.Parse()
 
 	if err := logsv1.ValidateAndApply(logOptions, nil); err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLog.Error(err, "Unable to start manager")
 		os.Exit(1)
 	}
 
@@ -194,13 +209,11 @@ func main() {
 	restConfig.Burst = restConfigBurst
 	restConfig.UserAgent = remote.DefaultClusterAPIUserAgent(controllerName)
 
-	tlsOptionOverrides, err := flags.GetTLSOptionOverrideFuncs(tlsOptions)
+	tlsOptions, metricsOptions, err := flags.GetManagerOptions(managerOptions)
 	if err != nil {
-		setupLog.Error(err, "unable to add TLS settings to the webhook server")
+		setupLog.Error(err, "Unable to start manager: invalid flags")
 		os.Exit(1)
 	}
-
-	diagnosticsOpts := flags.GetDiagnosticsOptions(diagnosticsOptions)
 
 	var watchNamespaces map[string]cache.Config
 	if watchNamespace != "" {
@@ -226,7 +239,7 @@ func main() {
 		LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
 		HealthProbeBindAddress:     healthAddr,
 		PprofBindAddress:           profilerAddress,
-		Metrics:                    diagnosticsOpts,
+		Metrics:                    *metricsOptions,
 		Cache: cache.Options{
 			DefaultNamespaces: watchNamespaces,
 			SyncPeriod:        &syncPeriod,
@@ -245,20 +258,24 @@ func main() {
 					&corev1.ConfigMap{},
 					&corev1.Secret{},
 				},
+				// Use the cache for all Unstructured get/list calls.
+				Unstructured: true,
 			},
 		},
 		WebhookServer: webhook.NewServer(
 			webhook.Options{
-				Port:    webhookPort,
-				CertDir: webhookCertDir,
-				TLSOpts: tlsOptionOverrides,
+				Port:     webhookPort,
+				CertDir:  webhookCertDir,
+				CertName: webhookCertName,
+				KeyName:  webhookKeyName,
+				TLSOpts:  tlsOptions,
 			},
 		),
 	}
 
 	mgr, err := ctrl.NewManager(restConfig, ctrlOptions)
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLog.Error(err, "Unable to start manager")
 		os.Exit(1)
 	}
 
@@ -269,21 +286,21 @@ func main() {
 	setupReconcilers(ctx, mgr)
 	setupWebhooks(mgr)
 
-	setupLog.Info("starting manager", "version", version.Get().String())
+	setupLog.Info("Starting manager", "version", version.Get().String())
 	if err := mgr.Start(ctx); err != nil {
-		setupLog.Error(err, "problem running manager")
+		setupLog.Error(err, "Problem running manager")
 		os.Exit(1)
 	}
 }
 
 func setupChecks(mgr ctrl.Manager) {
 	if err := mgr.AddReadyzCheck("webhook", mgr.GetWebhookServer().StartedChecker()); err != nil {
-		setupLog.Error(err, "unable to create ready check")
+		setupLog.Error(err, "Unable to create ready check")
 		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("webhook", mgr.GetWebhookServer().StartedChecker()); err != nil {
-		setupLog.Error(err, "unable to create health check")
+		setupLog.Error(err, "Unable to create health check")
 		os.Exit(1)
 	}
 }
@@ -296,50 +313,50 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager) {
 		},
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to create secret caching client")
+		setupLog.Error(err, "Unable to create secret caching client")
 		os.Exit(1)
 	}
 
 	// Set our runtime client into the context for later use
 	runtimeClient, err := container.NewDockerClient()
 	if err != nil {
-		setupLog.Error(err, "unable to establish container runtime connection", "controller", "reconciler")
+		setupLog.Error(err, "Unable to establish container runtime connection", "controller", "reconciler")
 		os.Exit(1)
 	}
 
-	tracker, err := remote.NewClusterCacheTracker(
-		mgr,
-		remote.ClusterCacheTrackerOptions{
-			SecretCachingClient: secretCachingClient,
-			ControllerName:      controllerName,
-			Log:                 &ctrl.Log,
+	clusterCache, err := clustercache.SetupWithManager(ctx, mgr, clustercache.Options{
+		SecretClient: secretCachingClient,
+		Cache:        clustercache.CacheOptions{},
+		Client: clustercache.ClientOptions{
+			QPS:       clusterCacheClientQPS,
+			Burst:     clusterCacheClientBurst,
+			UserAgent: remote.DefaultClusterAPIUserAgent(controllerName),
+			Cache: clustercache.ClientCacheOptions{
+				DisableFor: []client.Object{
+					// Don't cache ConfigMaps & Secrets.
+					&corev1.ConfigMap{},
+					&corev1.Secret{},
+				},
+			},
 		},
-	)
-	if err != nil {
-		setupLog.Error(err, "unable to create cluster cache tracker")
-		os.Exit(1)
-	}
-
-	if err := (&remote.ClusterCacheReconciler{
-		Client:           mgr.GetClient(),
-		Tracker:          tracker,
 		WatchFilterValue: watchFilterValue,
-	}).SetupWithManager(ctx, mgr, controller.Options{
-		MaxConcurrentReconciles: clusterCacheTrackerConcurrency,
-	}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "ClusterCacheReconciler")
+	}, controller.Options{
+		MaxConcurrentReconciles: clusterCacheConcurrency,
+	})
+	if err != nil {
+		setupLog.Error(err, "Unable to create ClusterCache")
 		os.Exit(1)
 	}
 
 	if err := (&controllers.DockerMachineReconciler{
 		Client:           mgr.GetClient(),
 		ContainerRuntime: runtimeClient,
-		Tracker:          tracker,
+		ClusterCache:     clusterCache,
 		WatchFilterValue: watchFilterValue,
 	}).SetupWithManager(ctx, mgr, controller.Options{
 		MaxConcurrentReconciles: concurrency,
 	}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DockerMachine")
+		setupLog.Error(err, "Unable to create controller", "controller", "DockerMachine")
 		os.Exit(1)
 	}
 
@@ -348,7 +365,7 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager) {
 		ContainerRuntime: runtimeClient,
 		WatchFilterValue: watchFilterValue,
 	}).SetupWithManager(ctx, mgr, controller.Options{}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DockerCluster")
+		setupLog.Error(err, "Unable to create controller", "controller", "DockerCluster")
 		os.Exit(1)
 	}
 
@@ -356,10 +373,9 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager) {
 		if err := (&expcontrollers.DockerMachinePoolReconciler{
 			Client:           mgr.GetClient(),
 			ContainerRuntime: runtimeClient,
-			Tracker:          tracker,
 			WatchFilterValue: watchFilterValue,
 		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: concurrency}); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "DockerMachinePool")
+			setupLog.Error(err, "Unable to create controller", "controller", "DockerMachinePool")
 			os.Exit(1)
 		}
 	}
@@ -367,23 +383,23 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager) {
 
 func setupWebhooks(mgr ctrl.Manager) {
 	if err := (&infrawebhooks.DockerMachineTemplate{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "DockerMachineTemplate")
+		setupLog.Error(err, "Unable to create webhook", "webhook", "DockerMachineTemplate")
 		os.Exit(1)
 	}
 
 	if err := (&infrawebhooks.DockerCluster{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "DockerCluster")
+		setupLog.Error(err, "Unable to create webhook", "webhook", "DockerCluster")
 		os.Exit(1)
 	}
 
 	if err := (&infrawebhooks.DockerClusterTemplate{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "DockerClusterTemplate")
+		setupLog.Error(err, "Unable to create webhook", "webhook", "DockerClusterTemplate")
 		os.Exit(1)
 	}
 
 	if feature.Gates.Enabled(feature.MachinePool) {
 		if err := (&infraexpwebhooks.DockerMachinePool{}).SetupWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "DockerMachinePool")
+			setupLog.Error(err, "Unable to create webhook", "webhook", "DockerMachinePool")
 			os.Exit(1)
 		}
 	}

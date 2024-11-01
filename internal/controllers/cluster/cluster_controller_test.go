@@ -33,10 +33,11 @@ import (
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	runtimev1 "sigs.k8s.io/cluster-api/exp/runtime/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/feature"
-	"sigs.k8s.io/cluster-api/internal/test/builder"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	conditionsv1beta2 "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/test/builder"
 )
 
 const (
@@ -80,6 +81,28 @@ func TestClusterReconciler(t *testing.T) {
 			}
 			return len(instance.Finalizers) > 0
 		}, timeout).Should(BeTrue())
+
+		// Validate the RemoteConnectionProbe condition is false (because kubeconfig Secret doesn't exist)
+		g.Eventually(func(g Gomega) {
+			g.Expect(env.Get(ctx, key, instance)).To(Succeed())
+
+			condition := conditionsv1beta2.Get(instance, clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition)
+			g.Expect(condition).ToNot(BeNil())
+			g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(Equal(clusterv1.ClusterRemoteConnectionProbeFailedV1Beta2Reason))
+		}, timeout).Should(Succeed())
+
+		t.Log("Creating the Cluster Kubeconfig Secret")
+		g.Expect(env.CreateKubeconfigSecret(ctx, instance)).To(Succeed())
+
+		g.Eventually(func(g Gomega) {
+			g.Expect(env.Get(ctx, key, instance)).To(Succeed())
+
+			condition := conditionsv1beta2.Get(instance, clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition)
+			g.Expect(condition).ToNot(BeNil())
+			g.Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+			g.Expect(condition.Reason).To(Equal(clusterv1.ClusterRemoteConnectionProbeSucceededV1Beta2Reason))
+		}, timeout).Should(Succeed())
 	})
 
 	t.Run("Should successfully patch a cluster object if the status diff is empty but the spec diff is not", func(t *testing.T) {
@@ -169,6 +192,50 @@ func TestClusterReconciler(t *testing.T) {
 				return false
 			}
 			return instance.Status.InfrastructureReady
+		}, timeout).Should(BeTrue())
+	})
+
+	t.Run("Should successfully patch a cluster object if the spec diff is empty but the status conditions diff is not", func(t *testing.T) {
+		g := NewWithT(t)
+
+		// Setup
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "test3-",
+				Namespace:    ns.Name,
+			},
+		}
+		g.Expect(env.Create(ctx, cluster)).To(Succeed())
+		key := client.ObjectKey{Name: cluster.Name, Namespace: cluster.Namespace}
+		defer func() {
+			err := env.Delete(ctx, cluster)
+			g.Expect(err).ToNot(HaveOccurred())
+		}()
+
+		// Wait for reconciliation to happen.
+		g.Eventually(func() bool {
+			if err := env.Get(ctx, key, cluster); err != nil {
+				return false
+			}
+			return len(cluster.Finalizers) > 0
+		}, timeout).Should(BeTrue())
+
+		// Patch
+		g.Eventually(func() bool {
+			ph, err := patch.NewHelper(cluster, env)
+			g.Expect(err).ToNot(HaveOccurred())
+			conditions.MarkTrue(cluster, clusterv1.InfrastructureReadyCondition)
+			g.Expect(ph.Patch(ctx, cluster, patch.WithStatusObservedGeneration{})).To(Succeed())
+			return true
+		}, timeout).Should(BeTrue())
+
+		// Assertions
+		g.Eventually(func() bool {
+			instance := &clusterv1.Cluster{}
+			if err := env.Get(ctx, key, instance); err != nil {
+				return false
+			}
+			return conditions.IsTrue(cluster, clusterv1.InfrastructureReadyCondition)
 		}, timeout).Should(BeTrue())
 	})
 
@@ -355,8 +422,8 @@ func TestClusterReconciler(t *testing.T) {
 }
 
 func TestClusterReconciler_reconcileDelete(t *testing.T) {
-	defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)()
-	defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)()
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)
 
 	fakeInfraCluster := builder.InfrastructureCluster("test-ns", "test-cluster").Build()
 
@@ -389,9 +456,8 @@ func TestClusterReconciler_reconcileDelete(t *testing.T) {
 			g := NewWithT(t)
 			fakeClient := fake.NewClientBuilder().WithObjects(fakeInfraCluster, tt.cluster).Build()
 			r := &Reconciler{
-				Client:                    fakeClient,
-				UnstructuredCachingClient: fakeClient,
-				APIReader:                 fakeClient,
+				Client:    fakeClient,
+				APIReader: fakeClient,
 			}
 
 			_, _ = r.reconcileDelete(ctx, tt.cluster)
@@ -527,8 +593,7 @@ func TestClusterReconcilerNodeRef(t *testing.T) {
 
 				c := fake.NewClientBuilder().WithObjects(cluster, controlPlaneWithNoderef, controlPlaneWithoutNoderef, nonControlPlaneWithNoderef, nonControlPlaneWithoutNoderef).Build()
 				r := &Reconciler{
-					Client:                    c,
-					UnstructuredCachingClient: c,
+					Client: c,
 				}
 				requests := r.controlPlaneMachineToCluster(ctx, tt.o)
 				g.Expect(requests).To(BeComparableTo(tt.want))

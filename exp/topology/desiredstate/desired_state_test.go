@@ -45,11 +45,11 @@ import (
 	"sigs.k8s.io/cluster-api/internal/contract"
 	"sigs.k8s.io/cluster-api/internal/hooks"
 	fakeruntimeclient "sigs.k8s.io/cluster-api/internal/runtime/client/fake"
-	"sigs.k8s.io/cluster-api/internal/test/builder"
 	"sigs.k8s.io/cluster-api/internal/topology/clustershim"
 	"sigs.k8s.io/cluster-api/internal/topology/names"
 	"sigs.k8s.io/cluster-api/internal/topology/ownerrefs"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/test/builder"
 )
 
 var (
@@ -642,7 +642,7 @@ func TestComputeControlPlane(t *testing.T) {
 
 func TestComputeControlPlaneVersion(t *testing.T) {
 	t.Run("Compute control plane version under various circumstances", func(t *testing.T) {
-		defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)()
+		utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
 
 		nonBlockingBeforeClusterUpgradeResponse := &runtimehooksv1.BeforeClusterUpgradeResponse{
 			CommonRetryResponse: runtimehooksv1.CommonRetryResponse{
@@ -888,7 +888,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 	})
 
 	t.Run("Calling AfterControlPlaneUpgrade hook", func(t *testing.T) {
-		defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)()
+		utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
 
 		catalog := runtimecatalog.New()
 		_ = runtimehooksv1.AddToCatalog(catalog)
@@ -1189,7 +1189,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 	})
 
 	t.Run("register intent to call AfterClusterUpgrade and AfterControlPlaneUpgrade hooks", func(t *testing.T) {
-		defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)()
+		utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
 
 		catalog := runtimecatalog.New()
 		_ = runtimehooksv1.AddToCatalog(catalog)
@@ -1329,6 +1329,9 @@ func TestComputeMachineDeployment(t *testing.T) {
 	var clusterClassMinReadySeconds int32 = 20
 	clusterClassStrategy := clusterv1.MachineDeploymentStrategy{
 		Type: clusterv1.OnDeleteMachineDeploymentStrategyType,
+		Remediation: &clusterv1.RemediationStrategy{
+			MaxInFlight: ptr.To(intstr.FromInt32(5)),
+		},
 	}
 	md1 := builder.MachineDeploymentClass("linux-worker").
 		WithLabels(labels).
@@ -1378,7 +1381,8 @@ func TestComputeMachineDeployment(t *testing.T) {
 				MachineHealthCheck: &clusterv1.MachineHealthCheckClass{
 					UnhealthyConditions: unhealthyConditions,
 					NodeStartupTimeout: &metav1.Duration{
-						Duration: time.Duration(1)},
+						Duration: time.Duration(1),
+					},
 				},
 			},
 		},
@@ -1390,6 +1394,9 @@ func TestComputeMachineDeployment(t *testing.T) {
 	var topologyMinReadySeconds int32 = 10
 	topologyStrategy := clusterv1.MachineDeploymentStrategy{
 		Type: clusterv1.RollingUpdateMachineDeploymentStrategyType,
+		Remediation: &clusterv1.RemediationStrategy{
+			MaxInFlight: ptr.To(intstr.FromInt32(5)),
+		},
 	}
 	mdTopology := clusterv1.MachineDeploymentTopology{
 		Metadata: clusterv1.ObjectMeta{
@@ -2900,7 +2907,8 @@ func Test_computeMachineHealthCheck(t *testing.T) {
 			},
 		},
 		NodeStartupTimeout: &metav1.Duration{
-			Duration: time.Duration(1)},
+			Duration: time.Duration(1),
+		},
 	}
 	selector := &metav1.LabelSelector{MatchLabels: map[string]string{
 		"foo": "bar",
@@ -2944,7 +2952,8 @@ func Test_computeMachineHealthCheck(t *testing.T) {
 				},
 			},
 			NodeStartupTimeout: &metav1.Duration{
-				Duration: time.Duration(1)},
+				Duration: time.Duration(1),
+			},
 		},
 	}
 

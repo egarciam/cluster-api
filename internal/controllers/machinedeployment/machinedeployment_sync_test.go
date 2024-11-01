@@ -582,6 +582,7 @@ func TestComputeDesiredMachineSet(t *testing.T) {
 					Bootstrap: clusterv1.Bootstrap{
 						ConfigRef: &bootstrapRef,
 					},
+					ReadinessGates:          []clusterv1.MachineReadinessGate{{ConditionType: "foo"}},
 					NodeDrainTimeout:        duration10s,
 					NodeVolumeDetachTimeout: duration10s,
 					NodeDeletionTimeout:     duration10s,
@@ -642,11 +643,14 @@ func TestComputeDesiredMachineSet(t *testing.T) {
 			"ms-label-1":                           "ms-value-1",
 		}
 		existingMS.Annotations = nil
+		// Pre-existing finalizer should be preserved.
+		existingMS.Finalizers = []string{"pre-existing-finalizer"}
 		existingMS.Spec.Template.Labels = map[string]string{
 			clusterv1.MachineDeploymentUniqueLabel: uniqueID,
 			"ms-label-2":                           "ms-value-2",
 		}
 		existingMS.Spec.Template.Annotations = nil
+		existingMS.Spec.Template.Spec.ReadinessGates = []clusterv1.MachineReadinessGate{{ConditionType: "bar"}}
 		existingMS.Spec.Template.Spec.NodeDrainTimeout = duration5s
 		existingMS.Spec.Template.Spec.NodeDeletionTimeout = duration5s
 		existingMS.Spec.Template.Spec.NodeVolumeDetachTimeout = duration5s
@@ -657,6 +661,9 @@ func TestComputeDesiredMachineSet(t *testing.T) {
 		expectedMS.UID = existingMSUID
 		expectedMS.Name = deployment.Name + "-" + uniqueID
 		expectedMS.Labels[clusterv1.MachineDeploymentUniqueLabel] = uniqueID
+		// Pre-existing finalizer should be preserved.
+		expectedMS.Finalizers = []string{"pre-existing-finalizer"}
+
 		expectedMS.Spec.Template.Labels[clusterv1.MachineDeploymentUniqueLabel] = uniqueID
 
 		g := NewWithT(t)
@@ -676,11 +683,14 @@ func TestComputeDesiredMachineSet(t *testing.T) {
 			"ms-label-1":                           "ms-value-1",
 		}
 		existingMS.Annotations = nil
+		// Pre-existing finalizer should be preserved.
+		existingMS.Finalizers = []string{"pre-existing-finalizer"}
 		existingMS.Spec.Template.Labels = map[string]string{
 			clusterv1.MachineDeploymentUniqueLabel: uniqueID,
 			"ms-label-2":                           "ms-value-2",
 		}
 		existingMS.Spec.Template.Annotations = nil
+		existingMS.Spec.Template.Spec.ReadinessGates = []clusterv1.MachineReadinessGate{{ConditionType: "bar"}}
 		existingMS.Spec.Template.Spec.NodeDrainTimeout = duration5s
 		existingMS.Spec.Template.Spec.NodeDeletionTimeout = duration5s
 		existingMS.Spec.Template.Spec.NodeVolumeDetachTimeout = duration5s
@@ -698,6 +708,8 @@ func TestComputeDesiredMachineSet(t *testing.T) {
 		expectedMS.UID = existingMSUID
 		expectedMS.Name = deployment.Name + "-" + uniqueID
 		expectedMS.Labels[clusterv1.MachineDeploymentUniqueLabel] = uniqueID
+		// Pre-existing finalizer should be preserved.
+		expectedMS.Finalizers = []string{"pre-existing-finalizer"}
 		expectedMS.Spec.Template.Labels[clusterv1.MachineDeploymentUniqueLabel] = uniqueID
 
 		g := NewWithT(t)
@@ -732,6 +744,7 @@ func TestComputeDesiredMachineSet(t *testing.T) {
 			"ms-label-2":                           "ms-value-2",
 		}
 		existingMS.Spec.Template.Annotations = nil
+		existingMS.Spec.Template.Spec.ReadinessGates = []clusterv1.MachineReadinessGate{{ConditionType: "bar"}}
 		existingMS.Spec.Template.Spec.NodeDrainTimeout = duration5s
 		existingMS.Spec.Template.Spec.NodeDeletionTimeout = duration5s
 		existingMS.Spec.Template.Spec.NodeVolumeDetachTimeout = duration5s
@@ -764,6 +777,9 @@ func assertMachineSet(g *WithT, actualMS *clusterv1.MachineSet, expectedMS *clus
 	}
 	// Check Namespace
 	g.Expect(actualMS.Namespace).Should(Equal(expectedMS.Namespace))
+
+	// Check finalizers
+	g.Expect(actualMS.Finalizers).Should(Equal(expectedMS.Finalizers))
 
 	// Check Replicas
 	g.Expect(actualMS.Spec.Replicas).ShouldNot(BeNil())

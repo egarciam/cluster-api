@@ -90,13 +90,13 @@ func (h *ExtensionHandlers) GeneratePatches(ctx context.Context, req *runtimehoo
 		switch obj := obj.(type) {
 		case *infrav1.DockerClusterTemplate:
 			if err := patchDockerClusterTemplate(ctx, obj, variables); err != nil {
-				log.Error(err, "error patching DockerClusterTemplate")
+				log.Error(err, "Error patching DockerClusterTemplate")
 				return errors.Wrap(err, "error patching DockerClusterTemplate")
 			}
 		case *controlplanev1.KubeadmControlPlaneTemplate:
 			err := patchKubeadmControlPlaneTemplate(ctx, obj, variables)
 			if err != nil {
-				log.Error(err, "error patching KubeadmControlPlaneTemplate")
+				log.Error(err, "Error patching KubeadmControlPlaneTemplate")
 				return errors.Wrapf(err, "error patching KubeadmControlPlaneTemplate")
 			}
 		case *bootstrapv1.KubeadmConfigTemplate:
@@ -105,7 +105,7 @@ func (h *ExtensionHandlers) GeneratePatches(ctx context.Context, req *runtimehoo
 			// linked to a specific MachineDeployment class; another option is to check the holderRef value and call
 			// this func or more specialized func conditionally.
 			if err := patchKubeadmConfigTemplate(ctx, obj, variables); err != nil {
-				log.Error(err, "error patching KubeadmConfigTemplate")
+				log.Error(err, "Error patching KubeadmConfigTemplate")
 				return errors.Wrap(err, "error patching KubeadmConfigTemplate")
 			}
 		case *infrav1.DockerMachineTemplate:
@@ -114,12 +114,12 @@ func (h *ExtensionHandlers) GeneratePatches(ctx context.Context, req *runtimehoo
 			// linked to ControlPlane or for DockerMachineTemplate linked to MachineDeployment classes; another option
 			// is to check the holderRef value and call this func or more specialized func conditionally.
 			if err := patchDockerMachineTemplate(ctx, obj, variables); err != nil {
-				log.Error(err, "error patching DockerMachineTemplate")
+				log.Error(err, "Error patching DockerMachineTemplate")
 				return errors.Wrap(err, "error patching DockerMachineTemplate")
 			}
 		case *infraexpv1.DockerMachinePoolTemplate:
 			if err := patchDockerMachinePoolTemplate(ctx, obj, variables); err != nil {
-				log.Error(err, "error patching DockerMachinePoolTemplate")
+				log.Error(err, "Error patching DockerMachinePoolTemplate")
 				return errors.Wrap(err, "error patching DockerMachinePoolTemplate")
 			}
 		}
@@ -331,13 +331,13 @@ func patchDockerMachineTemplate(ctx context.Context, dockerMachineTemplate *infr
 
 	// if found
 	if err == nil {
-		semVer, err := version.ParseMajorMinorPatchTolerant(cpVersion)
+		semVer, err := semver.ParseTolerant(cpVersion)
 		if err != nil {
 			return errors.Wrap(err, "could not parse control plane version")
 		}
 		kindMapping := kind.GetMapping(semVer, "")
 
-		log.Info(fmt.Sprintf("Setting MachineDeployment custom image to %q", kindMapping.Image))
+		log.Info(fmt.Sprintf("Setting control plane custom image to %q", kindMapping.Image))
 		dockerMachineTemplate.Spec.Template.Spec.CustomImage = kindMapping.Image
 		// return early if we have successfully patched a control plane dockerMachineTemplate
 		return nil
@@ -357,7 +357,7 @@ func patchDockerMachineTemplate(ctx context.Context, dockerMachineTemplate *infr
 		return errors.Wrap(err, "could not set customImage to MachineDeployment DockerMachineTemplate")
 	}
 
-	semVer, err := version.ParseMajorMinorPatchTolerant(mdVersion)
+	semVer, err := semver.ParseTolerant(mdVersion)
 	if err != nil {
 		return errors.Wrap(err, "could not parse MachineDeployment version")
 	}
@@ -424,8 +424,14 @@ func (h *ExtensionHandlers) DiscoverVariables(ctx context.Context, _ *runtimehoo
 				OpenAPIV3Schema: clusterv1.JSONSchemaProps{
 					Type:        "string",
 					Default:     &apiextensionsv1.JSON{Raw: []byte(`""`)},
-					Example:     &apiextensionsv1.JSON{Raw: []byte(`""`)},
+					Example:     &apiextensionsv1.JSON{Raw: []byte(`"0"`)},
 					Description: "kubeadmControlPlaneMaxSurge is the maximum number of control planes that can be scheduled above or under the desired number of control plane machines.",
+					XValidations: []clusterv1.ValidationRule{
+						{
+							Rule:              "self == \"\" || self != \"\"",
+							MessageExpression: "'just a test expression, got %s'.format([self])",
+						},
+					},
 				},
 			},
 		},
@@ -437,6 +443,14 @@ func (h *ExtensionHandlers) DiscoverVariables(ctx context.Context, _ *runtimehoo
 				OpenAPIV3Schema: clusterv1.JSONSchemaProps{
 					Type:    "string",
 					Example: &apiextensionsv1.JSON{Raw: []byte(`"kindest"`)},
+					XMetadata: &clusterv1.VariableSchemaMetadata{
+						Labels: map[string]string{
+							"objects": "DockerCluster",
+						},
+						Annotations: map[string]string{
+							"description": "Gets set at DockerCluster.Spec.Template.Spec.LoadBalancer.ImageRepository",
+						},
+					},
 				},
 			},
 			Metadata: clusterv1.ClusterClassVariableMetadata{

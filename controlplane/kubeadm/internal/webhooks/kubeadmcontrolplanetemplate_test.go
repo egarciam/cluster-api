@@ -33,7 +33,7 @@ import (
 )
 
 func TestKubeadmControlPlaneTemplateDefault(t *testing.T) {
-	defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)()
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)
 
 	g := NewWithT(t)
 
@@ -63,7 +63,7 @@ func TestKubeadmControlPlaneTemplateDefault(t *testing.T) {
 }
 
 func TestKubeadmControlPlaneTemplateValidationFeatureGateEnabled(t *testing.T) {
-	defer utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)()
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)
 
 	t.Run("create kubeadmcontrolplanetemplate should pass if gate enabled and valid kubeadmcontrolplanetemplate", func(t *testing.T) {
 		testnamespace := "test"
@@ -153,6 +153,80 @@ func TestKubeadmControlPlaneTemplateValidationMetadata(t *testing.T) {
 		webhook := &KubeadmControlPlaneTemplate{}
 		warnings, err := webhook.ValidateCreate(ctx, kcpTemplate)
 		g.Expect(err).To(HaveOccurred())
+		g.Expect(warnings).To(BeEmpty())
+	})
+}
+
+func TestKubeadmControlPlaneTemplateUpdateValidation(t *testing.T) {
+	t.Run("update KubeadmControlPlaneTemplate should pass if only defaulted fields are different", func(t *testing.T) {
+		g := NewWithT(t)
+		oldKCPTemplate := &controlplanev1.KubeadmControlPlaneTemplate{
+			Spec: controlplanev1.KubeadmControlPlaneTemplateSpec{
+				Template: controlplanev1.KubeadmControlPlaneTemplateResource{
+					Spec: controlplanev1.KubeadmControlPlaneTemplateResourceSpec{
+						MachineTemplate: &controlplanev1.KubeadmControlPlaneTemplateMachineTemplate{
+							NodeDrainTimeout: &metav1.Duration{Duration: time.Duration(10) * time.Minute},
+						},
+					},
+				},
+			},
+		}
+		newKCPTemplate := &controlplanev1.KubeadmControlPlaneTemplate{
+			Spec: controlplanev1.KubeadmControlPlaneTemplateSpec{
+				Template: controlplanev1.KubeadmControlPlaneTemplateResource{
+					Spec: controlplanev1.KubeadmControlPlaneTemplateResourceSpec{
+						KubeadmConfigSpec: bootstrapv1.KubeadmConfigSpec{
+							// Only this field is different, but defaulting will set it as well, so this should pass the immutability check.
+							Format: bootstrapv1.CloudConfig,
+						},
+						MachineTemplate: &controlplanev1.KubeadmControlPlaneTemplateMachineTemplate{
+							NodeDrainTimeout: &metav1.Duration{Duration: time.Duration(10) * time.Minute},
+						},
+					},
+				},
+			},
+		}
+		webhook := &KubeadmControlPlaneTemplate{}
+		warnings, err := webhook.ValidateUpdate(ctx, oldKCPTemplate, newKCPTemplate)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(warnings).To(BeEmpty())
+	})
+	t.Run("update kubeadmcontrolplanetemplate should not pass if fields are different", func(t *testing.T) {
+		g := NewWithT(t)
+		oldKCPTemplate := &controlplanev1.KubeadmControlPlaneTemplate{
+			Spec: controlplanev1.KubeadmControlPlaneTemplateSpec{
+				Template: controlplanev1.KubeadmControlPlaneTemplateResource{
+					Spec: controlplanev1.KubeadmControlPlaneTemplateResourceSpec{
+						MachineTemplate: &controlplanev1.KubeadmControlPlaneTemplateMachineTemplate{
+							NodeDrainTimeout: &metav1.Duration{Duration: time.Duration(10) * time.Minute},
+						},
+					},
+				},
+			},
+		}
+		newKCPTemplate := &controlplanev1.KubeadmControlPlaneTemplate{
+			Spec: controlplanev1.KubeadmControlPlaneTemplateSpec{
+				Template: controlplanev1.KubeadmControlPlaneTemplateResource{
+					Spec: controlplanev1.KubeadmControlPlaneTemplateResourceSpec{
+						KubeadmConfigSpec: bootstrapv1.KubeadmConfigSpec{
+							// Defaulting will set this field as well.
+							Format: bootstrapv1.CloudConfig,
+							// This will fail the immutability check.
+							PreKubeadmCommands: []string{
+								"new-cmd",
+							},
+						},
+						MachineTemplate: &controlplanev1.KubeadmControlPlaneTemplateMachineTemplate{
+							NodeDrainTimeout: &metav1.Duration{Duration: time.Duration(10) * time.Minute},
+						},
+					},
+				},
+			},
+		}
+		webhook := &KubeadmControlPlaneTemplate{}
+		warnings, err := webhook.ValidateUpdate(ctx, oldKCPTemplate, newKCPTemplate)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("KubeadmControlPlaneTemplate spec.template.spec field is immutable"))
 		g.Expect(warnings).To(BeEmpty())
 	})
 }

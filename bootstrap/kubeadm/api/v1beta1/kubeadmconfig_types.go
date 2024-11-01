@@ -132,6 +132,15 @@ func (c *KubeadmConfigSpec) Default() {
 	if c.JoinConfiguration != nil && c.JoinConfiguration.NodeRegistration.ImagePullPolicy == "" {
 		c.JoinConfiguration.NodeRegistration.ImagePullPolicy = "IfNotPresent"
 	}
+	if c.JoinConfiguration != nil && c.JoinConfiguration.Discovery.File != nil {
+		if kfg := c.JoinConfiguration.Discovery.File.KubeConfig; kfg != nil {
+			if kfg.User.Exec != nil {
+				if kfg.User.Exec.APIVersion == "" {
+					kfg.User.Exec.APIVersion = "client.authentication.k8s.io/v1"
+				}
+			}
+		}
+	}
 }
 
 // Validate ensures the KubeadmConfigSpec is valid.
@@ -141,6 +150,33 @@ func (c *KubeadmConfigSpec) Validate(pathPrefix *field.Path) field.ErrorList {
 	allErrs = append(allErrs, c.validateFiles(pathPrefix)...)
 	allErrs = append(allErrs, c.validateUsers(pathPrefix)...)
 	allErrs = append(allErrs, c.validateIgnition(pathPrefix)...)
+
+	// Validate JoinConfiguration.
+	if c.JoinConfiguration != nil {
+		if c.JoinConfiguration.Discovery.File != nil {
+			if kfg := c.JoinConfiguration.Discovery.File.KubeConfig; kfg != nil {
+				userPath := pathPrefix.Child("joinConfiguration", "discovery", "file", "kubeconfig", "user")
+				if kfg.User.AuthProvider == nil && kfg.User.Exec == nil {
+					allErrs = append(allErrs,
+						field.Invalid(
+							userPath,
+							kfg.User,
+							"at least one of authProvider or exec must be defined",
+						),
+					)
+				}
+				if kfg.User.AuthProvider != nil && kfg.User.Exec != nil {
+					allErrs = append(allErrs,
+						field.Invalid(
+							userPath,
+							kfg.User,
+							"either authProvider or exec must be defined",
+						),
+					)
+				}
+			}
+		}
+	}
 
 	return allErrs
 }
@@ -391,10 +427,16 @@ type KubeadmConfigStatus struct {
 	DataSecretName *string `json:"dataSecretName,omitempty"`
 
 	// FailureReason will be set on non-retryable errors
+	//
+	// Deprecated: This field is deprecated and is going to be removed in the next apiVersion. Please see https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more details.
+	//
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
 
 	// FailureMessage will be set on non-retryable errors
+	//
+	// Deprecated: This field is deprecated and is going to be removed in the next apiVersion. Please see https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more details.
+	//
 	// +optional
 	FailureMessage string `json:"failureMessage,omitempty"`
 
@@ -405,6 +447,22 @@ type KubeadmConfigStatus struct {
 	// Conditions defines current service state of the KubeadmConfig.
 	// +optional
 	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+
+	// v1beta2 groups all the fields that will be added or modified in KubeadmConfig's status with the V1Beta2 version.
+	// +optional
+	V1Beta2 *KubeadmConfigV1Beta2Status `json:"v1beta2,omitempty"`
+}
+
+// KubeadmConfigV1Beta2Status groups all the fields that will be added or modified in KubeadmConfig with the V1Beta2 version.
+// See https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more context.
+type KubeadmConfigV1Beta2Status struct {
+	// conditions represents the observations of a KubeadmConfig's current state.
+	// Known condition types are Ready, DataSecretAvailable, CertificatesAvailable.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=32
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -431,6 +489,22 @@ func (c *KubeadmConfig) GetConditions() clusterv1.Conditions {
 // SetConditions sets the conditions on this object.
 func (c *KubeadmConfig) SetConditions(conditions clusterv1.Conditions) {
 	c.Status.Conditions = conditions
+}
+
+// GetV1Beta2Conditions returns the set of conditions for this object.
+func (c *KubeadmConfig) GetV1Beta2Conditions() []metav1.Condition {
+	if c.Status.V1Beta2 == nil {
+		return nil
+	}
+	return c.Status.V1Beta2.Conditions
+}
+
+// SetV1Beta2Conditions sets conditions for an API object.
+func (c *KubeadmConfig) SetV1Beta2Conditions(conditions []metav1.Condition) {
+	if c.Status.V1Beta2 == nil && conditions != nil {
+		c.Status.V1Beta2 = &KubeadmConfigV1Beta2Status{}
+	}
+	c.Status.V1Beta2.Conditions = conditions
 }
 
 // +kubebuilder:object:root=true

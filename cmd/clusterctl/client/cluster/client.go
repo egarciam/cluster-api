@@ -200,7 +200,7 @@ func newClusterClient(kubeconfig Kubeconfig, configClient config.Client, options
 
 	// if there is an injected proxy, use it, otherwise use a default one
 	if client.proxy == nil {
-		client.proxy = newProxy(client.kubeconfig)
+		client.proxy = NewProxy(client.kubeconfig)
 	}
 
 	// if there is an injected repositoryClientFactory, use it, otherwise use the default one
@@ -227,7 +227,7 @@ func retryWithExponentialBackoff(ctx context.Context, opts wait.Backoff, operati
 		i++
 		if err := operation(ctx); err != nil {
 			if i < opts.Steps {
-				log.V(5).Info("Retrying with backoff", "Cause", err.Error())
+				log.V(5).Info("Retrying with backoff", "cause", err.Error())
 				return false, nil
 			}
 			return false, err

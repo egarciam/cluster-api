@@ -47,6 +47,12 @@ type ControlPlane struct {
 	// reconciliationTime is the time of the current reconciliation, and should be used for all "now" calculations
 	reconciliationTime metav1.Time
 
+	// InfraMachineTemplateIsNotFound is true if getting the infra machine template object failed with an NotFound err
+	InfraMachineTemplateIsNotFound bool
+
+	// PreflightChecks contains description about pre flight check results blocking machines creation or deletion.
+	PreflightCheckResults PreflightCheckResults
+
 	// TODO: we should see if we can combine these with the Machine objects so we don't have all these separate lookups
 	// See discussion on https://github.com/kubernetes-sigs/cluster-api/pull/3405
 	KubeadmConfigs map[string]*bootstrapv1.KubeadmConfig
@@ -54,6 +60,16 @@ type ControlPlane struct {
 
 	managementCluster ManagementCluster
 	workloadCluster   WorkloadCluster
+}
+
+// PreflightCheckResults contains description about pre flight check results blocking machines creation or deletion.
+type PreflightCheckResults struct {
+	// HasDeletingMachine reports true if preflight check detected a deleting machine.
+	HasDeletingMachine bool
+	// ControlPlaneComponentsNotHealthy reports true if preflight check detected that the control plane components are not fully healthy.
+	ControlPlaneComponentsNotHealthy bool
+	// EtcdClusterNotHealthy reports true if preflight check detected that the etcd cluster is not fully healthy.
+	EtcdClusterNotHealthy bool
 }
 
 // NewControlPlane returns an instantiated ControlPlane.
@@ -131,11 +147,15 @@ func (c *ControlPlane) FailureDomainWithMostMachines(ctx context.Context, machin
 }
 
 // NextFailureDomainForScaleUp returns the failure domain with the fewest number of up-to-date machines.
-func (c *ControlPlane) NextFailureDomainForScaleUp(ctx context.Context) *string {
+func (c *ControlPlane) NextFailureDomainForScaleUp(ctx context.Context) (*string, error) {
 	if len(c.Cluster.Status.FailureDomains.FilterControlPlane()) == 0 {
-		return nil
+		return nil, nil
 	}
-	return failuredomains.PickFewest(ctx, c.FailureDomains().FilterControlPlane(), c.UpToDateMachines())
+	upToDateMachines, err := c.UpToDateMachines()
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to determine next failure domain for scale up")
+	}
+	return failuredomains.PickFewest(ctx, c.FailureDomains().FilterControlPlane(), upToDateMachines), nil
 }
 
 // InitialControlPlaneConfig returns a new KubeadmConfigSpec that is to be used for an initializing control plane.
@@ -160,6 +180,11 @@ func (c *ControlPlane) HasDeletingMachine() bool {
 	return len(c.Machines.Filter(collections.HasDeletionTimestamp)) > 0
 }
 
+// DeletingMachines returns machines in the control plane that are in the process of being deleted.
+func (c *ControlPlane) DeletingMachines() collections.Machines {
+	return c.Machines.Filter(collections.HasDeletionTimestamp)
+}
+
 // GetKubeadmConfig returns the KubeadmConfig of a given machine.
 func (c *ControlPlane) GetKubeadmConfig(machineName string) (*bootstrapv1.KubeadmConfig, bool) {
 	kubeadmConfig, ok := c.KubeadmConfigs[machineName]
@@ -167,7 +192,7 @@ func (c *ControlPlane) GetKubeadmConfig(machineName string) (*bootstrapv1.Kubead
 }
 
 // MachinesNeedingRollout return a list of machines that need to be rolled out.
-func (c *ControlPlane) MachinesNeedingRollout() (collections.Machines, map[string]string) {
+func (c *ControlPlane) MachinesNeedingRollout() (collections.Machines, map[string]string, error) {
 	// Ignore machines to be deleted.
 	machines := c.Machines.Filter(collections.Not(collections.HasDeletionTimestamp))
 
@@ -175,26 +200,32 @@ func (c *ControlPlane) MachinesNeedingRollout() (collections.Machines, map[strin
 	machinesNeedingRollout := make(collections.Machines, len(machines))
 	rolloutReasons := map[string]string{}
 	for _, m := range machines {
-		reason, needsRollout := NeedsRollout(&c.reconciliationTime, c.KCP.Spec.RolloutAfter, c.KCP.Spec.RolloutBefore, c.InfraResources, c.KubeadmConfigs, c.KCP, m)
+		reason, needsRollout, err := NeedsRollout(&c.reconciliationTime, c.KCP.Spec.RolloutAfter, c.KCP.Spec.RolloutBefore, c.InfraResources, c.KubeadmConfigs, c.KCP, m)
+		if err != nil {
+			return nil, nil, err
+		}
 		if needsRollout {
 			machinesNeedingRollout.Insert(m)
 			rolloutReasons[m.Name] = reason
 		}
 	}
-	return machinesNeedingRollout, rolloutReasons
+	return machinesNeedingRollout, rolloutReasons, nil
 }
 
 // UpToDateMachines returns the machines that are up to date with the control
 // plane's configuration and therefore do not require rollout.
-func (c *ControlPlane) UpToDateMachines() collections.Machines {
+func (c *ControlPlane) UpToDateMachines() (collections.Machines, error) {
 	upToDateMachines := make(collections.Machines, len(c.Machines))
 	for _, m := range c.Machines {
-		_, needsRollout := NeedsRollout(&c.reconciliationTime, c.KCP.Spec.RolloutAfter, c.KCP.Spec.RolloutBefore, c.InfraResources, c.KubeadmConfigs, c.KCP, m)
+		_, needsRollout, err := NeedsRollout(&c.reconciliationTime, c.KCP.Spec.RolloutAfter, c.KCP.Spec.RolloutBefore, c.InfraResources, c.KubeadmConfigs, c.KCP, m)
+		if err != nil {
+			return nil, err
+		}
 		if !needsRollout {
 			upToDateMachines.Insert(m)
 		}
 	}
-	return upToDateMachines
+	return upToDateMachines, nil
 }
 
 // getInfraResources fetches the external infrastructure resource for each machine in the collection and returns a map of machine.Name -> infraResource.
@@ -238,19 +269,27 @@ func (c *ControlPlane) IsEtcdManaged() bool {
 	return c.KCP.Spec.KubeadmConfigSpec.ClusterConfiguration == nil || c.KCP.Spec.KubeadmConfigSpec.ClusterConfiguration.Etcd.External == nil
 }
 
-// UnhealthyMachines returns the list of control plane machines marked as unhealthy by MHC.
+// UnhealthyMachinesWithUnhealthyControlPlaneComponents returns all unhealthy control plane machines that
+// have unhealthy control plane components.
+// It differs from UnhealthyMachinesByHealthCheck which checks `MachineHealthCheck` conditions.
+func (c *ControlPlane) UnhealthyMachinesWithUnhealthyControlPlaneComponents(machines collections.Machines) collections.Machines {
+	return machines.Filter(collections.HasUnhealthyControlPlaneComponents(c.IsEtcdManaged()))
+}
+
+// UnhealthyMachines returns the list of control plane machines marked as unhealthy by MHC, no matter
+// if they are set to be remediated by KCP or not.
 func (c *ControlPlane) UnhealthyMachines() collections.Machines {
-	return c.Machines.Filter(collections.HasUnhealthyCondition)
+	return c.Machines.Filter(collections.IsUnhealthy)
 }
 
-// HealthyMachines returns the list of control plane machines not marked as unhealthy by MHC.
+// HealthyMachines returns the list of control plane machines marked as healthy by MHC (or not targeted by any MHC instance).
 func (c *ControlPlane) HealthyMachines() collections.Machines {
-	return c.Machines.Filter(collections.Not(collections.HasUnhealthyCondition))
+	return c.Machines.Filter(collections.Not(collections.IsUnhealthy))
 }
 
-// HasUnhealthyMachine returns true if any machine in the control plane is marked as unhealthy by MHC.
-func (c *ControlPlane) HasUnhealthyMachine() bool {
-	return len(c.UnhealthyMachines()) > 0
+// MachinesToBeRemediatedByKCP returns the list of control plane machines to be remediated by KCP.
+func (c *ControlPlane) MachinesToBeRemediatedByKCP() collections.Machines {
+	return c.Machines.Filter(collections.IsUnhealthyAndOwnerRemediated)
 }
 
 // HasHealthyMachineStillProvisioning returns true if any healthy machine in the control plane is still in the process of being provisioned.
@@ -270,6 +309,12 @@ func (c *ControlPlane) PatchMachines(ctx context.Context) error {
 				controlplanev1.MachineSchedulerPodHealthyCondition,
 				controlplanev1.MachineEtcdPodHealthyCondition,
 				controlplanev1.MachineEtcdMemberHealthyCondition,
+			}}, patch.WithOwnedV1Beta2Conditions{Conditions: []string{
+				controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyV1Beta2Condition,
+				controlplanev1.KubeadmControlPlaneMachineControllerManagerPodHealthyV1Beta2Condition,
+				controlplanev1.KubeadmControlPlaneMachineSchedulerPodHealthyV1Beta2Condition,
+				controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyV1Beta2Condition,
+				controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
 			}}); err != nil {
 				errList = append(errList, err)
 			}

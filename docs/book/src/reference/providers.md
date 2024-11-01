@@ -7,6 +7,7 @@ updated info about which API version they are supporting.
 
 ## Bootstrap
 - [Amazon Elastic Kubernetes Service (EKS)](https://github.com/kubernetes-sigs/cluster-api-provider-aws/tree/main/bootstrap/eks)
+- [Canonical Kubernetes](https://github.com/canonical/cluster-api-k8s)
 - [Kubeadm](https://github.com/kubernetes-sigs/cluster-api/tree/main/bootstrap/kubeadm)
 - [MicroK8s](https://github.com/canonical/cluster-api-bootstrap-provider-microk8s)
 - [Oracle Cloud Native Environment (OCNE)](https://github.com/verrazzano/cluster-api-provider-ocne)
@@ -15,6 +16,7 @@ updated info about which API version they are supporting.
 - [k0smotron/k0s](https://github.com/k0sproject/k0smotron)
 
 ## Control Plane
+- [Canonical Kubernetes](https://github.com/canonical/cluster-api-k8s)
 - [Kubeadm](https://github.com/kubernetes-sigs/cluster-api/tree/main/controlplane/kubeadm)
 - [MicroK8s](https://github.com/canonical/cluster-api-control-plane-provider-microk8s)
 - [Nested](https://github.com/kubernetes-sigs/cluster-api-provider-nested)
@@ -25,6 +27,7 @@ updated info about which API version they are supporting.
 - [k0smotron/k0s](https://github.com/k0sproject/k0smotron)
 
 ## Infrastructure
+- [Akamai (Linode)](https://linode.github.io/cluster-api-provider-linode/)
 - [AWS](https://cluster-api-aws.sigs.k8s.io/)
 - [Azure](https://github.com/kubernetes-sigs/cluster-api-provider-azure)
 - [Azure Stack HCI](https://github.com/microsoft/cluster-api-provider-azurestackhci)
@@ -37,6 +40,7 @@ updated info about which API version they are supporting.
 - [Hetzner](https://github.com/syself/cluster-api-provider-hetzner)
 - [Hivelocity](https://github.com/hivelocity/cluster-api-provider-hivelocity)
 - [IBM Cloud](https://github.com/kubernetes-sigs/cluster-api-provider-ibmcloud)
+- [IONOS Cloud](https://github.com/ionos-cloud/cluster-api-provider-ionoscloud)
 - [KubeKey](https://github.com/kubesphere/kubekey)
 - [KubeVirt](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt)
 - [MAAS](https://github.com/spectrocloud/cluster-api-provider-maas)
@@ -54,6 +58,7 @@ updated info about which API version they are supporting.
 - [Virtink](https://github.com/smartxworks/cluster-api-provider-virtink)
 - [VMware Cloud Director](https://github.com/vmware/cluster-api-provider-cloud-director)  
 - [vSphere](https://github.com/kubernetes-sigs/cluster-api-provider-vsphere)
+- [Vultr](https://github.com/vultr/cluster-api-provider-vultr)
 - [k0smotron RemoteMachine (SSH)](https://github.com/k0sproject/k0smotron)
 
 ## IP Address Management (IPAM)

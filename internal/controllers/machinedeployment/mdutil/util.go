@@ -23,20 +23,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/integer"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/internal/util/compare"
 	"sigs.k8s.io/cluster-api/util/conversion"
 )
 
@@ -119,16 +121,16 @@ func SetDeploymentRevision(deployment *clusterv1.MachineDeployment, revision str
 func MaxRevision(ctx context.Context, allMSs []*clusterv1.MachineSet) int64 {
 	log := ctrl.LoggerFrom(ctx)
 
-	max := int64(0)
+	maxVal := int64(0)
 	for _, ms := range allMSs {
 		if v, err := Revision(ms); err != nil {
 			// Skip the machine sets when it failed to parse their revision information
 			log.Error(err, fmt.Sprintf("Couldn't parse revision for MachineSet %s, deployment controller will skip it when reconciling revisions", ms.Name))
-		} else if v > max {
-			max = v
+		} else if v > maxVal {
+			maxVal = v
 		}
 	}
-	return max
+	return maxVal
 }
 
 // Revision returns the revision number of the input object.
@@ -371,11 +373,11 @@ func getMachineSetFraction(ms clusterv1.MachineSet, md clusterv1.MachineDeployme
 
 // EqualMachineTemplate returns true if two given machineTemplateSpec are equal,
 // ignoring all the in-place propagated fields, and the version from external references.
-func EqualMachineTemplate(template1, template2 *clusterv1.MachineTemplateSpec) bool {
+func EqualMachineTemplate(template1, template2 *clusterv1.MachineTemplateSpec) (equal bool, diff string, err error) {
 	t1Copy := MachineTemplateDeepCopyRolloutFields(template1)
 	t2Copy := MachineTemplateDeepCopyRolloutFields(template2)
 
-	return apiequality.Semantic.DeepEqual(t1Copy, t2Copy)
+	return compare.Diff(t1Copy, t2Copy)
 }
 
 // MachineTemplateDeepCopyRolloutFields copies a MachineTemplateSpec
@@ -389,6 +391,7 @@ func MachineTemplateDeepCopyRolloutFields(template *clusterv1.MachineTemplateSpe
 	templateCopy.Annotations = nil
 
 	// Drop node timeout values
+	templateCopy.Spec.ReadinessGates = nil
 	templateCopy.Spec.NodeDrainTimeout = nil
 	templateCopy.Spec.NodeDeletionTimeout = nil
 	templateCopy.Spec.NodeVolumeDetachTimeout = nil
@@ -415,37 +418,64 @@ func MachineTemplateDeepCopyRolloutFields(template *clusterv1.MachineTemplateSpe
 // not face a case where there exists a machine set matching the old logic but there does not exist a machineset matching the new logic.
 // In fact previously not matching MS can now start matching the target. Since there could be multiple matches, lets choose the
 // MS with the most replicas so that there is minimum machine churn.
-func FindNewMachineSet(deployment *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, reconciliationTime *metav1.Time) *clusterv1.MachineSet {
+func FindNewMachineSet(deployment *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, reconciliationTime *metav1.Time) (*clusterv1.MachineSet, string, error) {
+	if len(msList) == 0 {
+		return nil, "no MachineSets exist for the MachineDeployment", nil
+	}
+
+	// In rare cases, such as after cluster upgrades, Deployment may end up with
+	// having more than one new MachineSets that have the same template,
+	// see https://github.com/kubernetes/kubernetes/issues/40415
+	// We deterministically choose the oldest new MachineSet with matching template hash.
 	sort.Sort(MachineSetsByDecreasingReplicas(msList))
-	for i := range msList {
-		if EqualMachineTemplate(&msList[i].Spec.Template, &deployment.Spec.Template) &&
-			!shouldRolloutAfter(msList[i], reconciliationTime, deployment.Spec.RolloutAfter) {
-			// In rare cases, such as after cluster upgrades, Deployment may end up with
-			// having more than one new MachineSets that have the same template,
-			// see https://github.com/kubernetes/kubernetes/issues/40415
-			// We deterministically choose the oldest new MachineSet with matching template hash.
-			return msList[i]
+
+	var matchingMachineSets []*clusterv1.MachineSet
+	var diffs []string
+	for _, ms := range msList {
+		equal, diff, err := EqualMachineTemplate(&ms.Spec.Template, &deployment.Spec.Template)
+		if err != nil {
+			return nil, "", errors.Wrapf(err, "failed to compare MachineDeployment spec template with MachineSet %s", ms.Name)
+		}
+		if equal {
+			matchingMachineSets = append(matchingMachineSets, ms)
+		} else {
+			diffs = append(diffs, fmt.Sprintf("MachineSet %s: diff: %s", ms.Name, diff))
 		}
 	}
-	// new MachineSet does not exist.
-	return nil
-}
 
-func shouldRolloutAfter(ms *clusterv1.MachineSet, reconciliationTime *metav1.Time, rolloutAfter *metav1.Time) bool {
-	if ms == nil {
-		return false
+	if len(matchingMachineSets) == 0 {
+		return nil, fmt.Sprintf("couldn't find MachineSet matching MachineDeployment spec template: %s", strings.Join(diffs, ",")), nil
 	}
-	if reconciliationTime == nil || rolloutAfter == nil {
-		return false
+
+	// If RolloutAfter is not set, pick the first matching MachineSet.
+	if deployment.Spec.RolloutAfter == nil {
+		return matchingMachineSets[0], "", nil
 	}
-	return ms.CreationTimestamp.Before(rolloutAfter) && rolloutAfter.Before(reconciliationTime)
+
+	// If reconciliation time is before RolloutAfter, pick the first matching MachineSet.
+	if reconciliationTime.Before(deployment.Spec.RolloutAfter) {
+		return matchingMachineSets[0], "", nil
+	}
+
+	// Pick the first matching MachineSet that has been created after RolloutAfter.
+	for _, ms := range matchingMachineSets {
+		if ms.CreationTimestamp.After(deployment.Spec.RolloutAfter.Time) {
+			return ms, "", nil
+		}
+	}
+
+	// If no matching MachineSet was created after RolloutAfter, trigger creation of a new MachineSet.
+	return nil, fmt.Sprintf("RolloutAfter on MachineDeployment set to %s, no MachineSet has been created afterwards", deployment.Spec.RolloutAfter.Format(time.RFC3339)), nil
 }
 
 // FindOldMachineSets returns the old machine sets targeted by the given Deployment, within the given slice of MSes.
 // Returns a list of machine sets which contains all old machine sets.
-func FindOldMachineSets(deployment *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, reconciliationTime *metav1.Time) []*clusterv1.MachineSet {
+func FindOldMachineSets(deployment *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, reconciliationTime *metav1.Time) ([]*clusterv1.MachineSet, error) {
 	allMSs := make([]*clusterv1.MachineSet, 0, len(msList))
-	newMS := FindNewMachineSet(deployment, msList, reconciliationTime)
+	newMS, _, err := FindNewMachineSet(deployment, msList, reconciliationTime)
+	if err != nil {
+		return nil, err
+	}
 	for _, ms := range msList {
 		// Filter out new machine set
 		if newMS != nil && ms.UID == newMS.UID {
@@ -453,14 +483,14 @@ func FindOldMachineSets(deployment *clusterv1.MachineDeployment, msList []*clust
 		}
 		allMSs = append(allMSs, ms)
 	}
-	return allMSs
+	return allMSs, nil
 }
 
 // GetReplicaCountForMachineSets returns the sum of Replicas of the given machine sets.
 func GetReplicaCountForMachineSets(machineSets []*clusterv1.MachineSet) int32 {
 	totalReplicas := int32(0)
 	for _, ms := range machineSets {
-		if ms != nil {
+		if ms != nil && ms.Spec.Replicas != nil {
 			totalReplicas += *(ms.Spec.Replicas)
 		}
 	}
@@ -514,6 +544,42 @@ func GetAvailableReplicaCountForMachineSets(machineSets []*clusterv1.MachineSet)
 		}
 	}
 	return totalAvailableReplicas
+}
+
+// GetV1Beta2ReadyReplicaCountForMachineSets returns the number of ready machines corresponding to the given machine sets.
+// Note: When none of the ms.Status.V1Beta2.ReadyReplicas are set, the func returns nil.
+func GetV1Beta2ReadyReplicaCountForMachineSets(machineSets []*clusterv1.MachineSet) *int32 {
+	var totalReadyReplicas *int32
+	for _, ms := range machineSets {
+		if ms != nil && ms.Status.V1Beta2 != nil && ms.Status.V1Beta2.ReadyReplicas != nil {
+			totalReadyReplicas = ptr.To(ptr.Deref(totalReadyReplicas, 0) + *ms.Status.V1Beta2.ReadyReplicas)
+		}
+	}
+	return totalReadyReplicas
+}
+
+// GetV1Beta2AvailableReplicaCountForMachineSets returns the number of available machines corresponding to the given machine sets.
+// Note: When none of the ms.Status.V1Beta2.AvailableReplicas are set, the func returns nil.
+func GetV1Beta2AvailableReplicaCountForMachineSets(machineSets []*clusterv1.MachineSet) *int32 {
+	var totalAvailableReplicas *int32
+	for _, ms := range machineSets {
+		if ms != nil && ms.Status.V1Beta2 != nil && ms.Status.V1Beta2.AvailableReplicas != nil {
+			totalAvailableReplicas = ptr.To(ptr.Deref(totalAvailableReplicas, 0) + *ms.Status.V1Beta2.AvailableReplicas)
+		}
+	}
+	return totalAvailableReplicas
+}
+
+// GetV1Beta2UptoDateReplicaCountForMachineSets returns the number of up to date machines corresponding to the given machine sets.
+// Note: When none of the ms.Status.V1Beta2.UpToDateReplicas are set, the func returns nil.
+func GetV1Beta2UptoDateReplicaCountForMachineSets(machineSets []*clusterv1.MachineSet) *int32 {
+	var totalUpToDateReplicas *int32
+	for _, ms := range machineSets {
+		if ms != nil && ms.Status.V1Beta2 != nil && ms.Status.V1Beta2.UpToDateReplicas != nil {
+			totalUpToDateReplicas = ptr.To(ptr.Deref(totalUpToDateReplicas, 0) + *ms.Status.V1Beta2.UpToDateReplicas)
+		}
+	}
+	return totalUpToDateReplicas
 }
 
 // IsRollingUpdate returns true if the strategy type is a rolling update.

@@ -87,7 +87,7 @@ func K8SConformanceSpec(ctx context.Context, inputGetter func() K8SConformanceSp
 		Expect(kubetestConfigFilePath).To(BeAnExistingFile(), "%s should be a valid kubetest config file")
 
 		// Setup a Namespace where to host objects for this spec and create a watcher for the namespace events.
-		namespace, cancelWatches = setupSpecNamespace(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, input.PostNamespaceCreated)
+		namespace, cancelWatches = framework.SetupSpecNamespace(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, input.PostNamespaceCreated)
 		clusterResources = new(clusterctl.ApplyClusterTemplateAndWaitResult)
 	})
 
@@ -148,6 +148,7 @@ func K8SConformanceSpec(ctx context.Context, inputGetter func() K8SConformanceSp
 				ArtifactsDirectory: input.ArtifactFolder,
 				ConfigFilePath:     kubetestConfigFilePath,
 				GinkgoNodes:        ginkgoNodes,
+				ClusterName:        clusterResources.Cluster.GetName(),
 			},
 		)
 		Expect(err).ToNot(HaveOccurred(), "Failed to run Kubernetes conformance")
@@ -157,6 +158,6 @@ func K8SConformanceSpec(ctx context.Context, inputGetter func() K8SConformanceSp
 
 	AfterEach(func() {
 		// Dumps all the resources in the spec namespace, then cleanups the cluster object and the spec namespace itself.
-		dumpSpecResourcesAndCleanup(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, namespace, cancelWatches, clusterResources.Cluster, input.E2EConfig.GetIntervals, input.SkipCleanup)
+		framework.DumpSpecResourcesAndCleanup(ctx, specName, input.BootstrapClusterProxy, input.ArtifactFolder, namespace, cancelWatches, clusterResources.Cluster, input.E2EConfig.GetIntervals, input.SkipCleanup)
 	})
 }

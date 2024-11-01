@@ -27,26 +27,32 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/hooks"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	conditionsv1beta2 "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
+	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/paused"
 	"sigs.k8s.io/cluster-api/util/predicates"
 )
 
@@ -56,35 +62,47 @@ const (
 	deleteRequeueAfter = 5 * time.Second
 )
 
-// +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;patch
-// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;create;update;patch;delete
+// Update permissions on /finalizers subresrouce is required on management clusters with 'OwnerReferencesPermissionEnforcement' plugin enabled.
+// See: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#ownerreferencespermissionenforcement
+//
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;patch;update
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io;controlplane.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;clusters/finalizers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;clusters/finalizers,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 // Reconciler reconciles a Cluster object.
 type Reconciler struct {
-	Client                    client.Client
-	UnstructuredCachingClient client.Client
-	APIReader                 client.Reader
+	Client       client.Client
+	APIReader    client.Reader
+	ClusterCache clustercache.ClusterCache
 
 	// WatchFilterValue is the label value used to filter events prior to reconciliation.
 	WatchFilterValue string
+
+	RemoteConnectionGracePeriod time.Duration
 
 	recorder        record.EventRecorder
 	externalTracker external.ObjectTracker
 }
 
 func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
+	if r.Client == nil || r.APIReader == nil || r.ClusterCache == nil || r.RemoteConnectionGracePeriod == time.Duration(0) {
+		return errors.New("Client, APIReader and ClusterCache must not be nil and RemoteConnectionGracePeriod must not be 0")
+	}
+
+	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "cluster")
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.Cluster{}).
+		WatchesRawSource(r.ClusterCache.GetClusterSource("cluster", func(_ context.Context, o client.Object) []ctrl.Request {
+			return []ctrl.Request{{NamespacedName: client.ObjectKeyFromObject(o)}}
+		}, clustercache.WatchForProbeFailure(r.RemoteConnectionGracePeriod))).
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.controlPlaneMachineToCluster),
 		).
 		WithOptions(options).
-		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue)).
+		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Build(r)
 
 	if err != nil {
@@ -95,13 +113,12 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 	r.externalTracker = external.ObjectTracker{
 		Controller: c,
 		Cache:      mgr.GetCache(),
+		Scheme:     mgr.GetScheme(),
 	}
 	return nil
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reterr error) {
-	log := ctrl.LoggerFrom(ctx)
-
 	// Fetch the Cluster instance.
 	cluster := &clusterv1.Cluster{}
 	if err := r.Client.Get(ctx, req.NamespacedName, cluster); err != nil {
@@ -115,10 +132,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	// Return early if the object or Cluster is paused.
-	if annotations.IsPaused(cluster, cluster) {
-		log.Info("Reconciliation is paused for this object")
-		return ctrl.Result{}, nil
+	// Add finalizer first if not set to avoid the race condition between init and delete.
+	if finalizerAdded, err := finalizers.EnsureFinalizer(ctx, r.Client, cluster, clusterv1.ClusterFinalizer); err != nil || finalizerAdded {
+		return ctrl.Result{}, err
+	}
+
+	if isPaused, conditionChanged, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, cluster); err != nil || isPaused || conditionChanged {
+		return ctrl.Result{}, err
 	}
 
 	// Initialize the patch helper.
@@ -142,16 +162,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		}
 	}()
 
+	lastProbeSuccessTime := r.ClusterCache.GetLastProbeSuccessTimestamp(ctx, client.ObjectKeyFromObject(cluster))
+	if time.Since(lastProbeSuccessTime) > r.RemoteConnectionGracePeriod {
+		var msg string
+		if lastProbeSuccessTime.IsZero() {
+			msg = "Remote connection probe failed"
+		} else {
+			msg = fmt.Sprintf("Remote connection probe failed, probe last succeeded at %s", lastProbeSuccessTime.Format(time.RFC3339))
+		}
+		conditionsv1beta2.Set(cluster, metav1.Condition{
+			Type:    clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition,
+			Status:  metav1.ConditionFalse,
+			Reason:  clusterv1.ClusterRemoteConnectionProbeFailedV1Beta2Reason,
+			Message: msg,
+		})
+	} else {
+		conditionsv1beta2.Set(cluster, metav1.Condition{
+			Type:    clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition,
+			Status:  metav1.ConditionTrue,
+			Reason:  clusterv1.ClusterRemoteConnectionProbeSucceededV1Beta2Reason,
+			Message: "Remote connection probe succeeded",
+		})
+	}
+
 	// Handle deletion reconciliation loop.
 	if !cluster.ObjectMeta.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, cluster)
-	}
-
-	// Add finalizer first if not set to avoid the race condition between init and delete.
-	// Note: Finalizers in general can only be added when the deletionTimestamp is not set.
-	if !controllerutil.ContainsFinalizer(cluster, clusterv1.ClusterFinalizer) {
-		controllerutil.AddFinalizer(cluster, clusterv1.ClusterFinalizer)
-		return ctrl.Result{}, nil
 	}
 
 	// Handle normal reconciliation loop.
@@ -249,12 +285,18 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, cluster *clusterv1.Clu
 				// Don't handle deleted child
 				continue
 			}
-			gvk := child.GetObjectKind().GroupVersionKind().String()
 
-			log.Info("Deleting child object", "gvk", gvk, "name", child.GetName())
+			gvk, err := apiutil.GVKForObject(child, r.Client.Scheme())
+			if err != nil {
+				errs = append(errs, errors.Wrapf(err, "error getting gvk for child object"))
+				continue
+			}
+
+			log := log.WithValues(gvk.Kind, klog.KObj(child))
+			log.Info("Deleting child object")
 			if err := r.Client.Delete(ctx, child); err != nil {
 				err = errors.Wrapf(err, "error deleting cluster %s/%s: failed to delete %s %s", cluster.Namespace, cluster.Name, gvk, child.GetName())
-				log.Error(err, "Error deleting resource", "gvk", gvk, "name", child.GetName())
+				log.Error(err, "Error deleting resource")
 				errs = append(errs, err)
 			}
 		}
@@ -272,7 +314,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, cluster *clusterv1.Clu
 	}
 
 	if cluster.Spec.ControlPlaneRef != nil {
-		obj, err := external.Get(ctx, r.UnstructuredCachingClient, cluster.Spec.ControlPlaneRef, cluster.Namespace)
+		obj, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef, cluster.Namespace)
 		switch {
 		case apierrors.IsNotFound(errors.Cause(err)):
 			// All good - the control plane resource has been deleted
@@ -303,7 +345,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, cluster *clusterv1.Clu
 	}
 
 	if cluster.Spec.InfrastructureRef != nil {
-		obj, err := external.Get(ctx, r.UnstructuredCachingClient, cluster.Spec.InfrastructureRef, cluster.Namespace)
+		obj, err := external.Get(ctx, r.Client, cluster.Spec.InfrastructureRef, cluster.Namespace)
 		switch {
 		case apierrors.IsNotFound(errors.Cause(err)):
 			// All good - the infra resource has been deleted
