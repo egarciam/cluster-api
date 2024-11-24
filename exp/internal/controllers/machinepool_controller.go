@@ -134,9 +134,10 @@ func (r *MachinePoolReconciler) SetupWithManager(ctx context.Context, mgr ctrl.M
 	r.controller = c
 	r.recorder = mgr.GetEventRecorderFor("machinepool-controller")
 	r.externalTracker = external.ObjectTracker{
-		Controller: c,
-		Cache:      mgr.GetCache(),
-		Scheme:     mgr.GetScheme(),
+		Controller:      c,
+		Cache:           mgr.GetCache(),
+		Scheme:          mgr.GetScheme(),
+		PredicateLogger: &predicateLog,
 	}
 	r.ssaCache = ssa.NewCache()
 
@@ -340,10 +341,10 @@ func (r *MachinePoolReconciler) reconcileDeleteExternal(ctx context.Context, mac
 			continue
 		}
 
-		obj, err := external.Get(ctx, r.Client, ref, machinePool.Namespace)
+		obj, err := external.Get(ctx, r.Client, ref)
 		if err != nil && !apierrors.IsNotFound(errors.Cause(err)) {
 			return false, errors.Wrapf(err, "failed to get %s %q for MachinePool %q in namespace %q",
-				ref.GroupVersionKind(), ref.Name, machinePool.Name, machinePool.Namespace)
+				ref.GroupVersionKind(), ref.Name, machinePool.Name, ref.Namespace)
 		}
 		if obj != nil {
 			objects = append(objects, obj)
@@ -371,12 +372,12 @@ func (r *MachinePoolReconciler) watchClusterNodes(ctx context.Context, cluster *
 		return nil
 	}
 
-	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.WatchInput{
+	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.NewWatcher(clustercache.WatcherOptions{
 		Name:         "machinepool-watchNodes",
 		Watcher:      r.controller,
 		Kind:         &corev1.Node{},
 		EventHandler: handler.EnqueueRequestsFromMapFunc(r.nodeToMachinePool),
-	})
+	}))
 }
 
 func (r *MachinePoolReconciler) nodeToMachinePool(ctx context.Context, o client.Object) []reconcile.Request {

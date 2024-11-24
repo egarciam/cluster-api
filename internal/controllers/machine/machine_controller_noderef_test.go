@@ -351,14 +351,14 @@ func TestGetNode(t *testing.T) {
 
 	// Retry because the ClusterCache might not have immediately created the clusterAccessor.
 	g.Eventually(func(g Gomega) {
-		g.Expect(clusterCache.Watch(ctx, util.ObjectKey(testCluster), clustercache.WatchInput{
+		g.Expect(clusterCache.Watch(ctx, util.ObjectKey(testCluster), clustercache.NewWatcher(clustercache.WatcherOptions{
 			Name:    "TestGetNode",
 			Watcher: w,
 			Kind:    &corev1.Node{},
 			EventHandler: handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
 				return nil
 			}),
-		})).To(Succeed())
+		}))).To(Succeed())
 	}, 1*time.Minute, 5*time.Second).Should(Succeed())
 
 	for _, tc := range testCases {
@@ -412,12 +412,14 @@ func TestNodeLabelSync(t *testing.T) {
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config1",
+					Namespace:  metav1.NamespaceDefault,
 				},
 			},
 			InfrastructureRef: corev1.ObjectReference{
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 		},
 	}
@@ -450,6 +452,8 @@ func TestNodeLabelSync(t *testing.T) {
 
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
 		machine.Spec.ProviderID = ptr.To(nodeProviderID)
 
 		// Set Machine labels.

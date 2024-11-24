@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -36,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -357,6 +359,7 @@ func TestReconcileMachinePoolRequest(t *testing.T) {
 								APIVersion: builder.InfrastructureGroupVersion.String(),
 								Kind:       builder.TestInfrastructureMachinePoolKind,
 								Name:       "infra-config1",
+								Namespace:  metav1.NamespaceDefault,
 							},
 							Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 						},
@@ -404,6 +407,7 @@ func TestReconcileMachinePoolRequest(t *testing.T) {
 								APIVersion: builder.InfrastructureGroupVersion.String(),
 								Kind:       builder.TestInfrastructureMachinePoolKind,
 								Name:       "infra-config1-already-deleted", // Use an InfrastructureMachinePool that doesn't exist, so reconcileDelete doesn't get stuck on deletion
+								Namespace:  metav1.NamespaceDefault,
 							},
 							Bootstrap:           clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 							NodeDeletionTimeout: &metav1.Duration{Duration: 10 * time.Minute},
@@ -466,6 +470,7 @@ func TestReconcileMachinePoolRequest(t *testing.T) {
 								APIVersion: builder.InfrastructureGroupVersion.String(),
 								Kind:       builder.TestInfrastructureMachinePoolKind,
 								Name:       "infra-config1-already-deleted", // Use an InfrastructureMachinePool that doesn't exist, so reconcileDelete doesn't get stuck on deletion
+								Namespace:  metav1.NamespaceDefault,
 							},
 							Bootstrap:           clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 							NodeDeletionTimeout: &metav1.Duration{Duration: 10 * time.Minute},
@@ -528,6 +533,7 @@ func TestReconcileMachinePoolRequest(t *testing.T) {
 								APIVersion: builder.InfrastructureGroupVersion.String(),
 								Kind:       builder.TestInfrastructureMachinePoolKind,
 								Name:       "infra-config1-already-deleted", // Use an InfrastructureMachinePool that doesn't exist, so reconcileDelete doesn't get stuck on deletion
+								Namespace:  metav1.NamespaceDefault,
 							},
 							Bootstrap:           clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 							NodeDeletionTimeout: &metav1.Duration{Duration: 10 * time.Second}, // timeout passed
@@ -601,9 +607,10 @@ func TestReconcileMachinePoolRequest(t *testing.T) {
 				APIReader:    clientFake,
 				ClusterCache: clustercache.NewFakeClusterCache(trackerClientFake, client.ObjectKey{Name: testCluster.Name, Namespace: testCluster.Namespace}),
 				externalTracker: external.ObjectTracker{
-					Controller: externalfake.Controller{},
-					Cache:      &informertest.FakeInformers{},
-					Scheme:     clientFake.Scheme(),
+					Controller:      externalfake.Controller{},
+					Cache:           &informertest.FakeInformers{},
+					Scheme:          clientFake.Scheme(),
+					PredicateLogger: ptr.To(logr.New(log.NullLogSink{})),
 				},
 			}
 
@@ -761,12 +768,14 @@ func TestReconcileMachinePoolDeleteExternal(t *testing.T) {
 						APIVersion: builder.InfrastructureGroupVersion.String(),
 						Kind:       builder.TestInfrastructureMachineTemplateKind,
 						Name:       "delete-infra",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{
 						ConfigRef: &corev1.ObjectReference{
 							APIVersion: builder.BootstrapGroupVersion.String(),
 							Kind:       builder.TestBootstrapConfigKind,
 							Name:       "delete-bootstrap",
+							Namespace:  metav1.NamespaceDefault,
 						},
 					},
 				},
@@ -864,6 +873,7 @@ func TestRemoveMachinePoolFinalizerAfterDeleteReconcile(t *testing.T) {
 						APIVersion: builder.InfrastructureGroupVersion.String(),
 						Kind:       builder.TestInfrastructureMachineTemplateKind,
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -957,12 +967,14 @@ func TestMachinePoolConditions(t *testing.T) {
 						APIVersion: builder.InfrastructureGroupVersion.String(),
 						Kind:       builder.TestInfrastructureMachineTemplateKind,
 						Name:       "infra1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{
 						ConfigRef: &corev1.ObjectReference{
 							APIVersion: builder.BootstrapGroupVersion.String(),
 							Kind:       builder.TestBootstrapConfigKind,
 							Name:       "bootstrap1",
+							Namespace:  metav1.NamespaceDefault,
 						},
 					},
 				},
@@ -1165,9 +1177,10 @@ func TestMachinePoolConditions(t *testing.T) {
 				APIReader:    clientFake,
 				ClusterCache: clustercache.NewFakeClusterCache(clientFake, client.ObjectKey{Name: testCluster.Name, Namespace: testCluster.Namespace}),
 				externalTracker: external.ObjectTracker{
-					Controller: externalfake.Controller{},
-					Cache:      &informertest.FakeInformers{},
-					Scheme:     clientFake.Scheme(),
+					Controller:      externalfake.Controller{},
+					Cache:           &informertest.FakeInformers{},
+					Scheme:          clientFake.Scheme(),
+					PredicateLogger: ptr.To(logr.New(log.NullLogSink{})),
 				},
 			}
 

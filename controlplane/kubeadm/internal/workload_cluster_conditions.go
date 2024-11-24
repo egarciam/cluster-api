@@ -19,7 +19,9 @@ package internal
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -37,14 +40,45 @@ import (
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
+	clog "sigs.k8s.io/cluster-api/util/log"
 )
 
 // UpdateEtcdConditions is responsible for updating machine conditions reflecting the status of all the etcd members.
 // This operation is best effort, in the sense that in case of problems in retrieving member status, it sets
 // the condition to Unknown state without returning any error.
 func (w *Workload) UpdateEtcdConditions(ctx context.Context, controlPlane *ControlPlane) {
+	shouldRetry := func() bool {
+		// if CP is scaling up or down.
+		if ptr.Deref(controlPlane.KCP.Spec.Replicas, 0) != int32(len(controlPlane.Machines)) {
+			return true
+		}
+		// if CP machines are provisioning or deleting.
+		for _, m := range controlPlane.Machines {
+			if m.Status.NodeRef == nil {
+				return true
+			}
+			if !m.DeletionTimestamp.IsZero() {
+				return true
+			}
+		}
+		return false
+	}
+
 	if controlPlane.IsEtcdManaged() {
-		w.updateManagedEtcdConditions(ctx, controlPlane)
+		// Update etcd conditions.
+		// In case of well known temporary errors + control plane scaling up/down or rolling out, retry a few times.
+		// Note: this is required because there isn't a watch mechanism on etcd.
+		maxRetry := 3
+		for i := range maxRetry {
+			retryableError := w.updateManagedEtcdConditions(ctx, controlPlane)
+			// if we should retry and there is a retry left, wait a bit.
+			if !retryableError || !shouldRetry() {
+				break
+			}
+			if i < maxRetry-1 {
+				time.Sleep(time.Duration(250*(i+1)) * time.Millisecond)
+			}
+		}
 		return
 	}
 	w.updateExternalEtcdConditions(ctx, controlPlane)
@@ -60,10 +94,9 @@ func (w *Workload) updateExternalEtcdConditions(_ context.Context, controlPlane 
 	// As soon as the v1beta1 condition above will be removed, we should drop this func entirely.
 }
 
-func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane *ControlPlane) {
+func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane *ControlPlane) (retryableError bool) {
 	// NOTE: This methods uses control plane nodes only to get in contact with etcd but then it relies on etcd
 	// as ultimate source of truth for the list of members and for their health.
-	// TODO: Integrate this with clustercache / handle the grace period
 	controlPlaneNodes, err := w.getControlPlaneNodes(ctx)
 	if err != nil {
 		for _, m := range controlPlane.Machines {
@@ -85,7 +118,7 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 			Reason:  controlplanev1.KubeadmControlPlaneEtcdClusterInspectionFailedV1Beta2Reason,
 			Message: "Failed to get Nodes hosting the etcd cluster",
 		})
-		return
+		return retryableError
 	}
 
 	// Update conditions for etcd members on the nodes.
@@ -94,17 +127,24 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 		kcpErrors []string
 		// clusterID is used to store and compare the etcd's cluster id.
 		clusterID *uint64
-		// members is used to store the list of etcd members and compare with all the other nodes in the cluster.
-		members []*etcd.Member
 	)
 
 	provisioningMachines := controlPlane.Machines.Filter(collections.Not(collections.HasNode()))
 	for _, machine := range provisioningMachines {
+		var msg string
+		if ptr.Deref(machine.Spec.ProviderID, "") != "" {
+			// If the machine is at the end of the provisioning phase, with ProviderID set, but still waiting
+			// for a matching Node to exists, surface this.
+			msg = fmt.Sprintf("Waiting for a Node with spec.providerID %s to exist", *machine.Spec.ProviderID)
+		} else {
+			// If the machine is at the beginning of the provisioning phase, with ProviderID not yet set, surface this.
+			msg = fmt.Sprintf("Waiting for %s to report spec.providerID", machine.Spec.InfrastructureRef.Kind)
+		}
 		v1beta2conditions.Set(machine, metav1.Condition{
 			Type:    controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
 			Status:  metav1.ConditionUnknown,
 			Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberInspectionFailedV1Beta2Reason,
-			Message: "Node does not exist",
+			Message: msg,
 		})
 	}
 
@@ -132,32 +172,46 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 			conditions.MarkFalse(machine, controlplanev1.MachineEtcdMemberHealthyCondition, clusterv1.DeletingReason, clusterv1.ConditionSeverityInfo, "")
 
 			v1beta2conditions.Set(machine, metav1.Condition{
-				Type:   controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
-				Status: metav1.ConditionFalse,
-				Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberDeletingV1Beta2Reason,
+				Type:    controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
+				Status:  metav1.ConditionFalse,
+				Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberDeletingV1Beta2Reason,
+				Message: "Machine is deleting",
 			})
 			continue
 		}
 
 		currentMembers, err := w.getCurrentEtcdMembers(ctx, machine, node.Name)
 		if err != nil {
+			// Note. even if we fail reading the member list from one node/etcd members we do not set EtcdMembersAgreeOnMemberList and EtcdMembersAgreeOnClusterID to false
+			// (those info are computed on what we can collect during inspection, so we can reason about availability even if there is a certain degree of problems in the cluster).
+
+			// While scaling up/down or rolling out new CP machines this error might happen.
+			retryableError = true
 			continue
 		}
 
 		// Check if the list of members IDs reported is the same as all other members.
 		// NOTE: the first member reporting this information is the baseline for this information.
-		if members == nil {
-			members = currentMembers
+		// Also, if this is the first node we are reading from let's
+		// assume all the members agree on member list and cluster id.
+		if controlPlane.EtcdMembers == nil {
+			controlPlane.EtcdMembers = currentMembers
+			controlPlane.EtcdMembersAgreeOnMemberList = true
+			controlPlane.EtcdMembersAgreeOnClusterID = true
 		}
-		if !etcdutil.MemberEqual(members, currentMembers) {
-			conditions.MarkFalse(machine, controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Etcd member reports the cluster is composed by members %s, but all previously seen etcd members are reporting %s", etcdutil.MemberNames(currentMembers), etcdutil.MemberNames(members))
+		if !etcdutil.MemberEqual(controlPlane.EtcdMembers, currentMembers) {
+			controlPlane.EtcdMembersAgreeOnMemberList = false
+			conditions.MarkFalse(machine, controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Etcd member reports the cluster is composed by members %s, but all previously seen etcd members are reporting %s", etcdutil.MemberNames(currentMembers), etcdutil.MemberNames(controlPlane.EtcdMembers))
 
 			v1beta2conditions.Set(machine, metav1.Condition{
 				Type:    controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberNotHealthyV1Beta2Reason,
-				Message: fmt.Sprintf("The etcd member hosted on this Machine reports the cluster is composed by %s, but all previously seen etcd members are reporting %s", etcdutil.MemberNames(currentMembers), etcdutil.MemberNames(members)),
+				Message: fmt.Sprintf("The etcd member hosted on this Machine reports the cluster is composed by %s, but all previously seen etcd members are reporting %s", etcdutil.MemberNames(currentMembers), etcdutil.MemberNames(controlPlane.EtcdMembers)),
 			})
+
+			// While scaling up/down or rolling out new CP machines this error might happen because we are reading the list from different nodes at different time.
+			retryableError = true
 			continue
 		}
 
@@ -204,6 +258,7 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 			clusterID = &member.ClusterID
 		}
 		if *clusterID != member.ClusterID {
+			controlPlane.EtcdMembersAgreeOnClusterID = false
 			conditions.MarkFalse(machine, controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Etcd member has cluster ID %d, but all previously seen etcd members have cluster ID %d", member.ClusterID, *clusterID)
 
 			v1beta2conditions.Set(machine, metav1.Condition{
@@ -225,7 +280,17 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 	}
 
 	// Make sure that the list of etcd members and machines is consistent.
-	kcpErrors = compareMachinesAndMembers(controlPlane, members, kcpErrors)
+	// NOTE: Members/Machines consistency is computed based on the info KCP was able to collect during inspection (e.g. if on a 3 CP
+	// control plane one etcd member is down, the comparison is based on the answer collected from two members only).
+	// NOTE: We surface the result of compareMachinesAndMembers for the Available condition only if all the etcd members agree
+	// on member list and cluster id (if not, we consider the list of members not reliable).
+	membersAndMachinesAreMatching, membersAndMachinesCompareErrors := compareMachinesAndMembers(controlPlane, controlPlaneNodes, controlPlane.EtcdMembers)
+	if controlPlane.EtcdMembersAgreeOnMemberList && controlPlane.EtcdMembersAgreeOnClusterID {
+		controlPlane.EtcdMembersAndMachinesAreMatching = membersAndMachinesAreMatching
+	} else {
+		controlPlane.EtcdMembersAndMachinesAreMatching = false
+	}
+	kcpErrors = append(kcpErrors, membersAndMachinesCompareErrors...)
 
 	// Aggregate components error from machines at KCP level
 	aggregateConditionsFromMachinesToKCP(aggregateConditionsFromMachinesToKCPInput{
@@ -248,6 +313,7 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 		trueReason:        controlplanev1.KubeadmControlPlaneEtcdClusterHealthyV1Beta2Reason,
 		note:              "etcd member",
 	})
+	return retryableError
 }
 
 func (w *Workload) getCurrentEtcdMembers(ctx context.Context, machine *clusterv1.Machine, nodeName string) ([]*etcd.Member, error) {
@@ -298,11 +364,17 @@ func (w *Workload) getCurrentEtcdMembers(ctx context.Context, machine *clusterv1
 	return currentMembers, nil
 }
 
-func compareMachinesAndMembers(controlPlane *ControlPlane, members []*etcd.Member, kcpErrors []string) []string {
-	// NOTE: We run this check only if we actually know the list of members, otherwise the first for loop
-	// could generate a false negative when reporting missing etcd members.
+func compareMachinesAndMembers(controlPlane *ControlPlane, nodes *corev1.NodeList, members []*etcd.Member) (bool, []string) {
+	membersAndMachinesAreMatching := true
+	var kcpErrors []string
+
+	// If it failed to get members, consider the check failed in case there is at least a machine already provisioned
+	// (tolerate if we fail getting members when the cluster is provisioning the first machine).
 	if members == nil {
-		return kcpErrors
+		if len(controlPlane.Machines.Filter(collections.HasNode())) > 0 {
+			membersAndMachinesAreMatching = false
+		}
+		return membersAndMachinesAreMatching, nil
 	}
 
 	// Check Machine -> Etcd member.
@@ -318,6 +390,8 @@ func compareMachinesAndMembers(controlPlane *ControlPlane, members []*etcd.Membe
 			}
 		}
 		if !found {
+			// Surface there is a machine without etcd member on machine's EtcdMemberHealthy condition.
+			// The same info will also surface into the EtcdClusterHealthy condition on kcp.
 			conditions.MarkFalse(machine, controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Missing etcd member")
 
 			v1beta2conditions.Set(machine, metav1.Condition{
@@ -326,27 +400,57 @@ func compareMachinesAndMembers(controlPlane *ControlPlane, members []*etcd.Membe
 				Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberNotHealthyV1Beta2Reason,
 				Message: fmt.Sprintf("Etcd doesn't have an etcd member for Node %s", machine.Status.NodeRef.Name),
 			})
+
+			// Instead, surface there is a machine without etcd member on kcp's' Available condition
+			// only if the machine is not deleting and the node exists by more than two minutes
+			// (this prevents the condition to flick during scale up operations).
+			// Note: Two minutes is the time after which we expect the system to detect the new etcd member on the machine.
+			if machine.DeletionTimestamp.IsZero() {
+				oldNode := false
+				if nodes != nil {
+					for _, node := range nodes.Items {
+						if machine.Status.NodeRef.Name == node.Name && time.Since(node.CreationTimestamp.Time) > 2*time.Minute {
+							oldNode = true
+						}
+					}
+				}
+				if oldNode {
+					membersAndMachinesAreMatching = false
+				}
+			}
 		}
 	}
 
 	// Check Etcd member -> Machine.
 	for _, member := range members {
 		found := false
+		hasProvisioningMachine := false
 		for _, machine := range controlPlane.Machines {
-			if machine.Status.NodeRef != nil && machine.Status.NodeRef.Name == member.Name {
+			if machine.Status.NodeRef == nil {
+				hasProvisioningMachine = true
+				continue
+			}
+			if machine.Status.NodeRef.Name == member.Name {
 				found = true
 				break
 			}
 		}
 		if !found {
+			// Surface there is an etcd member without a machine into the EtcdClusterHealthy condition on kcp.
 			name := member.Name
 			if name == "" {
 				name = fmt.Sprintf("%d (Name not yet assigned)", member.ID)
 			}
 			kcpErrors = append(kcpErrors, fmt.Sprintf("Etcd member %s does not have a corresponding Machine", name))
+
+			// Instead, surface there is an etcd member without a machine on kcp's Available condition
+			// only if there are no provisioning machines (this prevents the condition to flick during scale up operations).
+			if !hasProvisioningMachine {
+				membersAndMachinesAreMatching = false
+			}
 		}
 	}
-	return kcpErrors
+	return membersAndMachinesAreMatching, kcpErrors
 }
 
 // UpdateStaticPodConditions is responsible for updating machine conditions reflecting the status of all the control plane
@@ -372,7 +476,6 @@ func (w *Workload) UpdateStaticPodConditions(ctx context.Context, controlPlane *
 	}
 
 	// NOTE: this fun uses control plane nodes from the workload cluster as a source of truth for the current state.
-	// TODO: integrate this with clustercache / handle the grace period
 	controlPlaneNodes, err := w.getControlPlaneNodes(ctx)
 	if err != nil {
 		for i := range controlPlane.Machines {
@@ -408,11 +511,20 @@ func (w *Workload) UpdateStaticPodConditions(ctx context.Context, controlPlane *
 	provisioningMachines := controlPlane.Machines.Filter(collections.Not(collections.HasNode()))
 	for _, machine := range provisioningMachines {
 		for _, condition := range allMachinePodV1beta2Conditions {
+			var msg string
+			if ptr.Deref(machine.Spec.ProviderID, "") != "" {
+				// If the machine is at the end of the provisioning phase, with ProviderID set, but still waiting
+				// for a matching Node to exists, surface this.
+				msg = fmt.Sprintf("Waiting for a Node with spec.providerID %s to exist", *machine.Spec.ProviderID)
+			} else {
+				// If the machine is at the beginning of the provisioning phase, with ProviderID not yet set, surface this.
+				msg = fmt.Sprintf("Waiting for %s to report spec.providerID", machine.Spec.InfrastructureRef.Kind)
+			}
 			v1beta2conditions.Set(machine, metav1.Condition{
 				Type:    condition,
 				Status:  metav1.ConditionUnknown,
 				Reason:  controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason,
-				Message: "Node does not exist",
+				Message: msg,
 			})
 		}
 	}
@@ -446,9 +558,10 @@ func (w *Workload) UpdateStaticPodConditions(ctx context.Context, controlPlane *
 
 			for _, condition := range allMachinePodV1beta2Conditions {
 				v1beta2conditions.Set(machine, metav1.Condition{
-					Type:   condition,
-					Status: metav1.ConditionFalse,
-					Reason: controlplanev1.KubeadmControlPlaneMachinePodDeletingV1Beta2Reason,
+					Type:    condition,
+					Status:  metav1.ConditionFalse,
+					Reason:  controlplanev1.KubeadmControlPlaneMachinePodDeletingV1Beta2Reason,
+					Message: "Machine is deleting",
 				})
 			}
 			continue
@@ -579,7 +692,7 @@ func (w *Workload) updateStaticPodCondition(ctx context.Context, machine *cluste
 				Type:    staticPodV1beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  controlplanev1.KubeadmControlPlaneMachinePodDoesNotExistV1Beta2Reason,
-				Message: fmt.Sprintf("Pod %s does not exist", podKey.Name),
+				Message: "Pod does not exist",
 			})
 			return
 		}
@@ -881,33 +994,91 @@ func aggregateV1Beta2ConditionsFromMachinesToKCP(input aggregateV1Beta2Condition
 	kcpMachinesWithUnknown := sets.Set[string]{}
 	kcpMachinesWithInfo := sets.Set[string]{}
 
+	messageMap := map[string][]string{}
 	for i := range input.controlPlane.Machines {
 		machine := input.controlPlane.Machines[i]
+		machineMessages := []string{}
+		conditionCount := 0
+		conditionMessages := sets.Set[string]{}
 		for _, condition := range input.machineConditions {
 			if machineCondition := v1beta2conditions.Get(machine, condition); machineCondition != nil {
+				conditionCount++
+				conditionMessages.Insert(machineCondition.Message)
 				switch machineCondition.Status {
 				case metav1.ConditionTrue:
 					kcpMachinesWithInfo.Insert(machine.Name)
 				case metav1.ConditionFalse:
 					kcpMachinesWithErrors.Insert(machine.Name)
+					m := machineCondition.Message
+					if m == "" {
+						m = fmt.Sprintf("condition is %s", machineCondition.Status)
+					}
+					machineMessages = append(machineMessages, fmt.Sprintf("  * %s: %s", machineCondition.Type, m))
 				case metav1.ConditionUnknown:
 					kcpMachinesWithUnknown.Insert(machine.Name)
+					m := machineCondition.Message
+					if m == "" {
+						m = fmt.Sprintf("condition is %s", machineCondition.Status)
+					}
+					machineMessages = append(machineMessages, fmt.Sprintf("  * %s: %s", machineCondition.Type, m))
 				}
 			}
 		}
+
+		if len(machineMessages) > 0 {
+			if conditionCount > 1 && len(conditionMessages) == 1 {
+				message := fmt.Sprintf("  * Control plane components: %s", conditionMessages.UnsortedList()[0])
+				messageMap[message] = append(messageMap[message], machine.Name)
+				continue
+			}
+
+			message := strings.Join(machineMessages, "\n")
+			messageMap[message] = append(messageMap[message], machine.Name)
+		}
 	}
+
+	// compute the order of messages according to the number of machines reporting the same message.
+	// Note: The list of object names is used as a secondary criteria to sort messages with the same number of objects.
+	messageIndex := make([]string, 0, len(messageMap))
+	for m := range messageMap {
+		messageIndex = append(messageIndex, m)
+	}
+
+	sort.SliceStable(messageIndex, func(i, j int) bool {
+		return len(messageMap[messageIndex[i]]) > len(messageMap[messageIndex[j]]) ||
+			(len(messageMap[messageIndex[i]]) == len(messageMap[messageIndex[j]]) && strings.Join(messageMap[messageIndex[i]], ",") < strings.Join(messageMap[messageIndex[j]], ","))
+	})
+
+	// Build the message
+	messages := []string{}
+	for _, message := range messageIndex {
+		machines := messageMap[message]
+		machinesMessage := "Machine"
+		if len(messageMap[message]) > 1 {
+			machinesMessage += "s"
+		}
+
+		sort.Strings(machines)
+		machinesMessage += " " + clog.ListToString(machines, func(s string) string { return s }, 3)
+
+		messages = append(messages, fmt.Sprintf("* %s:\n%s", machinesMessage, message))
+	}
+
+	// Append messages impacting KCP as a whole, if any
+	if len(input.kcpErrors) > 0 {
+		for _, message := range input.kcpErrors {
+			messages = append(messages, fmt.Sprintf("* %s", message))
+		}
+	}
+	message := strings.Join(messages, "\n")
 
 	// In case of at least one machine with errors or KCP level errors (nodes without machines), report false.
 	if len(input.kcpErrors) > 0 || len(kcpMachinesWithErrors) > 0 {
-		messages := input.kcpErrors
-		if len(kcpMachinesWithErrors) > 0 {
-			messages = append(messages, fmt.Sprintf("Following Machines are reporting %s errors: %s", input.note, strings.Join(sets.List(kcpMachinesWithErrors), ", ")))
-		}
 		v1beta2conditions.Set(input.controlPlane.KCP, metav1.Condition{
 			Type:    input.condition,
 			Status:  metav1.ConditionFalse,
 			Reason:  input.falseReason,
-			Message: strings.Join(messages, ", "),
+			Message: message,
 		})
 		return
 	}
@@ -918,7 +1089,7 @@ func aggregateV1Beta2ConditionsFromMachinesToKCP(input aggregateV1Beta2Condition
 			Type:    input.condition,
 			Status:  metav1.ConditionUnknown,
 			Reason:  input.unknownReason,
-			Message: fmt.Sprintf("Following Machines are reporting %s unknown: %s", input.note, strings.Join(sets.List(kcpMachinesWithUnknown), ", ")),
+			Message: message,
 		})
 		return
 	}

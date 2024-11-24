@@ -49,6 +49,7 @@ import (
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/controllers/noderefutil"
+	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/controllers/machine/drain"
 	"sigs.k8s.io/cluster-api/internal/util/cache"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
@@ -83,6 +84,7 @@ var (
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status;machines/finalizers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinedrainrules,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 // Reconciler reconciles a Machine object.
@@ -169,9 +171,10 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 	r.controller = c
 	r.recorder = mgr.GetEventRecorderFor("machine-controller")
 	r.externalTracker = external.ObjectTracker{
-		Controller: c,
-		Cache:      mgr.GetCache(),
-		Scheme:     mgr.GetScheme(),
+		Controller:      c,
+		Cache:           mgr.GetCache(),
+		Scheme:          mgr.GetScheme(),
+		PredicateLogger: &predicateLog,
 	}
 	r.ssaCache = ssa.NewCache()
 	r.reconcileDeleteCache = cache.New[cache.ReconcileEntry]()
@@ -215,6 +218,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 
 	if isPaused, conditionChanged, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, m); err != nil || isPaused || conditionChanged {
 		return ctrl.Result{}, err
+	}
+
+	if !m.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Check reconcileDeleteCache to ensure we won't run reconcileDelete too frequently.
+		// Note: The reconcileDelete func will add entries to the cache.
+		if cacheEntry, ok := r.reconcileDeleteCache.Has(cache.NewReconcileEntryKey(m)); ok {
+			if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
+				return ctrl.Result{RequeueAfter: requeueAfter}, nil
+			}
+		}
 	}
 
 	s := &scope{
@@ -307,8 +320,6 @@ func patchMachine(ctx context.Context, patchHelper *patch.Helper, machine *clust
 			clusterv1.BootstrapReadyCondition,
 			clusterv1.InfrastructureReadyCondition,
 			clusterv1.DrainingSucceededCondition,
-			clusterv1.MachineHealthCheckSucceededCondition,
-			clusterv1.MachineOwnerRemediatedCondition,
 		}},
 		patch.WithOwnedV1Beta2Conditions{Conditions: []string{
 			clusterv1.MachineAvailableV1Beta2Condition,
@@ -417,13 +428,6 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	cluster := s.cluster
 	m := s.machine
 
-	// Check reconcileDeleteCache to ensure we won't run reconcileDelete too frequently.
-	if cacheEntry, ok := r.reconcileDeleteCache.Has(cache.NewReconcileEntryKey(s.machine)); ok {
-		if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
-			return ctrl.Result{RequeueAfter: requeueAfter}, nil
-		}
-	}
-
 	s.reconcileDeleteExecuted = true
 
 	// Add entry to the reconcileDeleteCache so we won't run reconcileDelete more than once per second.
@@ -433,8 +437,8 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	r.reconcileDeleteCache.Add(cache.NewReconcileEntry(s.machine, time.Now().Add(1*time.Second)))
 
 	// Set "fallback" reason and message. This is used if we don't set a more specific reason and message below.
-	s.deletingReason = clusterv1.MachineDeletingDeletionTimestampSetV1Beta2Reason
-	s.deletingMessage = ""
+	s.deletingReason = clusterv1.MachineDeletingV1Beta2Reason
+	s.deletingMessage = "Deletion started"
 
 	err := r.isDeleteNodeAllowed(ctx, cluster, m)
 	isDeleteNodeAllowed := err == nil
@@ -623,13 +627,22 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	}
 
 	s.deletingReason = clusterv1.MachineDeletingDeletionCompletedV1Beta2Reason
-	s.deletingMessage = ""
+	s.deletingMessage = "Deletion completed"
 
 	controllerutil.RemoveFinalizer(m, clusterv1.MachineFinalizer)
 	return ctrl.Result{}, nil
 }
 
+// KubeadmControlPlanePreTerminateHookCleanupAnnotation inlined from KCP (we want to avoid importing the KCP API package).
+const KubeadmControlPlanePreTerminateHookCleanupAnnotation = clusterv1.PreTerminateDeleteHookAnnotationPrefix + "/kcp-cleanup"
+
 func (r *Reconciler) isNodeDrainAllowed(m *clusterv1.Machine) bool {
+	if util.IsControlPlaneMachine(m) && util.HasOwner(m.GetOwnerReferences(), clusterv1.GroupVersion.String(), []string{"KubeadmControlPlane"}) {
+		if _, exists := m.Annotations[KubeadmControlPlanePreTerminateHookCleanupAnnotation]; !exists {
+			return false
+		}
+	}
+
 	if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeNodeDrainingAnnotation]; exists {
 		return false
 	}
@@ -644,6 +657,12 @@ func (r *Reconciler) isNodeDrainAllowed(m *clusterv1.Machine) bool {
 // isNodeVolumeDetachingAllowed returns False if either ExcludeWaitForNodeVolumeDetachAnnotation annotation is set OR
 // nodeVolumeDetachTimeoutExceeded timeout is exceeded, otherwise returns True.
 func (r *Reconciler) isNodeVolumeDetachingAllowed(m *clusterv1.Machine) bool {
+	if util.IsControlPlaneMachine(m) && util.HasOwner(m.GetOwnerReferences(), clusterv1.GroupVersion.String(), []string{"KubeadmControlPlane"}) {
+		if _, exists := m.Annotations[KubeadmControlPlanePreTerminateHookCleanupAnnotation]; !exists {
+			return false
+		}
+	}
+
 	if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation]; exists {
 		return false
 	}
@@ -732,7 +751,7 @@ func (r *Reconciler) isDeleteNodeAllowed(ctx context.Context, cluster *clusterv1
 	// controlPlaneRef is an optional field in the Cluster so skip the external
 	// managed control plane check if it is nil
 	if cluster.Spec.ControlPlaneRef != nil {
-		controlPlane, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef, cluster.Spec.ControlPlaneRef.Namespace)
+		controlPlane, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef)
 		if apierrors.IsNotFound(err) {
 			// If control plane object in the reference does not exist, log and skip check for
 			// external managed control plane
@@ -808,7 +827,8 @@ func (r *Reconciler) drainNode(ctx context.Context, s *scope) (ctrl.Result, erro
 	}
 
 	drainer := &drain.Helper{
-		Client:             remoteClient,
+		Client:             r.Client,
+		RemoteClient:       remoteClient,
 		GracePeriodSeconds: -1,
 	}
 
@@ -840,7 +860,7 @@ func (r *Reconciler) drainNode(ctx context.Context, s *scope) (ctrl.Result, erro
 		return ctrl.Result{}, errors.Wrapf(err, "failed to cordon Node %s", node.Name)
 	}
 
-	podDeleteList, err := drainer.GetPodsForEviction(ctx, nodeName)
+	podDeleteList, err := drainer.GetPodsForEviction(ctx, cluster, machine, nodeName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -875,6 +895,7 @@ func (r *Reconciler) drainNode(ctx context.Context, s *scope) (ctrl.Result, erro
 	log.Info(fmt.Sprintf("Drain not completed yet, requeuing in %s", drainRetryInterval),
 		"podsFailedEviction", drain.PodListToString(podsFailedEviction, 5),
 		"podsWithDeletionTimestamp", drain.PodListToString(evictionResult.PodsDeletionTimestampSet, 5),
+		"podsToTriggerEvictionLater", drain.PodListToString(evictionResult.PodsToTriggerEvictionLater, 5),
 	)
 	return ctrl.Result{RequeueAfter: drainRetryInterval}, nil
 }
@@ -928,7 +949,7 @@ func (r *Reconciler) shouldWaitForNodeVolumes(ctx context.Context, s *scope) (ct
 	}
 
 	// Get all PVCs we want to ignore because they belong to Pods for which we skipped drain.
-	pvcsToIgnoreFromPods, err := getPersistentVolumeClaimsToIgnore(ctx, remoteClient, nodeName)
+	pvcsToIgnoreFromPods, err := getPersistentVolumeClaimsToIgnore(ctx, r.Client, remoteClient, cluster, machine, nodeName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1049,12 +1070,12 @@ func (r *Reconciler) watchClusterNodes(ctx context.Context, cluster *clusterv1.C
 		return nil
 	}
 
-	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.WatchInput{
+	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.NewWatcher(clustercache.WatcherOptions{
 		Name:         "machine-watchNodes",
 		Watcher:      r.controller,
 		Kind:         &corev1.Node{},
 		EventHandler: handler.EnqueueRequestsFromMapFunc(r.nodeToMachine),
-	})
+	}))
 }
 
 func (r *Reconciler) nodeToMachine(ctx context.Context, o client.Object) []reconcile.Request {
@@ -1122,17 +1143,19 @@ func getAttachedVolumeInformation(ctx context.Context, remoteClient client.Clien
 		attachedVolumeName.Insert(string(attachedVolume.Name))
 	}
 
-	volumeAttachments, err := getVolumeAttachmentForNode(ctx, remoteClient, node.GetName())
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to list VolumeAttachments")
-	}
-
-	for _, va := range volumeAttachments {
-		// Return an error if a VolumeAttachments does not refer a PersistentVolume.
-		if va.Spec.Source.PersistentVolumeName == nil {
-			return nil, nil, errors.Errorf("spec.source.persistentVolumeName for VolumeAttachment %s is not set", va.GetName())
+	if feature.Gates.Enabled(feature.MachineWaitForVolumeDetachConsiderVolumeAttachments) {
+		volumeAttachments, err := getVolumeAttachmentForNode(ctx, remoteClient, node.GetName())
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "failed to list VolumeAttachments")
 		}
-		attachedPVNames.Insert(*va.Spec.Source.PersistentVolumeName)
+
+		for _, va := range volumeAttachments {
+			// Return an error if a VolumeAttachments does not refer a PersistentVolume.
+			if va.Spec.Source.PersistentVolumeName == nil {
+				return nil, nil, errors.Errorf("spec.source.persistentVolumeName for VolumeAttachment %s is not set", va.GetName())
+			}
+			attachedPVNames.Insert(*va.Spec.Source.PersistentVolumeName)
+		}
 	}
 
 	return attachedVolumeName, attachedPVNames, nil
@@ -1141,17 +1164,18 @@ func getAttachedVolumeInformation(ctx context.Context, remoteClient client.Clien
 // getPersistentVolumeClaimsToIgnore gets all pods which have been ignored by drain and returns a list of
 // NamespacedNames for all PersistentVolumeClaims referred by the pods.
 // Note: this does not require us to list PVC's directly.
-func getPersistentVolumeClaimsToIgnore(ctx context.Context, remoteClient client.Client, nodeName string) (sets.Set[string], error) {
+func getPersistentVolumeClaimsToIgnore(ctx context.Context, c client.Client, remoteClient client.Client, cluster *clusterv1.Cluster, machine *clusterv1.Machine, nodeName string) (sets.Set[string], error) {
 	drainHelper := drain.Helper{
-		Client: remoteClient,
+		Client:       c,
+		RemoteClient: remoteClient,
 	}
 
-	pods, err := drainHelper.GetPodsForEviction(ctx, nodeName)
+	pods, err := drainHelper.GetPodsForEviction(ctx, cluster, machine, nodeName)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to find PersistentVolumeClaims from Pods ignored during drain")
 	}
 
-	ignoredPods := pods.IgnoredPods()
+	ignoredPods := pods.SkippedPods()
 
 	pvcsToIgnore := sets.Set[string]{}
 

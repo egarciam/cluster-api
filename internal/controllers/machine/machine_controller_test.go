@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/record"
+	utilfeature "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
@@ -37,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -44,6 +47,7 @@ import (
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	externalfake "sigs.k8s.io/cluster-api/controllers/external/fake"
+	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/util/cache"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
@@ -152,12 +156,14 @@ func TestWatches(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -288,12 +294,14 @@ func TestWatchesDelete(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -438,12 +446,14 @@ func TestMachine_Reconcile(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -857,6 +867,7 @@ func TestReconcileRequest(t *testing.T) {
 						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericInfrastructureMachine",
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -886,6 +897,7 @@ func TestReconcileRequest(t *testing.T) {
 						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericInfrastructureMachine",
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -919,6 +931,7 @@ func TestReconcileRequest(t *testing.T) {
 						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericInfrastructureMachine",
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -949,9 +962,10 @@ func TestReconcileRequest(t *testing.T) {
 				recorder:             record.NewFakeRecorder(10),
 				reconcileDeleteCache: cache.New[cache.ReconcileEntry](),
 				externalTracker: external.ObjectTracker{
-					Controller: externalfake.Controller{},
-					Cache:      &informertest.FakeInformers{},
-					Scheme:     clientFake.Scheme(),
+					Controller:      externalfake.Controller{},
+					Cache:           &informertest.FakeInformers{},
+					Scheme:          clientFake.Scheme(),
+					PredicateLogger: ptr.To(logr.New(log.NullLogSink{})),
 				},
 			}
 
@@ -1036,12 +1050,14 @@ func TestMachineConditions(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config1",
+					Namespace:  metav1.NamespaceDefault,
 				},
 			},
 		},
@@ -1240,9 +1256,10 @@ func TestMachineConditions(t *testing.T) {
 				ClusterCache: clustercache.NewFakeClusterCache(clientFake, client.ObjectKey{Name: testCluster.Name, Namespace: testCluster.Namespace}),
 				ssaCache:     ssa.NewCache(),
 				externalTracker: external.ObjectTracker{
-					Controller: externalfake.Controller{},
-					Cache:      &informertest.FakeInformers{},
-					Scheme:     clientFake.Scheme(),
+					Controller:      externalfake.Controller{},
+					Cache:           &informertest.FakeInformers{},
+					Scheme:          clientFake.Scheme(),
+					PredicateLogger: ptr.To(logr.New(log.NullLogSink{})),
 				},
 			}
 
@@ -1283,6 +1300,7 @@ func TestRemoveMachineFinalizerAfterDeleteReconcile(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 		},
@@ -1328,6 +1346,55 @@ func TestIsNodeDrainedAllowed(t *testing.T) {
 					Namespace:   metav1.NamespaceDefault,
 					Finalizers:  []string{clusterv1.MachineFinalizer},
 					Annotations: map[string]string{clusterv1.ExcludeNodeDrainingAnnotation: "existed!!"},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: false,
+		},
+		{
+			name: "KCP machine with the pre terminate hook should drain",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-machine",
+					Namespace:   metav1.NamespaceDefault,
+					Labels:      map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					Annotations: map[string]string{KubeadmControlPlanePreTerminateHookCleanupAnnotation: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: clusterv1.GroupVersion.String(),
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: true,
+		},
+		{
+			name: "KCP machine without the pre terminate hook should stop draining",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-machine",
+					Namespace: metav1.NamespaceDefault,
+					Labels:    map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: clusterv1.GroupVersion.String(),
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
 				},
 				Spec: clusterv1.MachineSpec{
 					ClusterName:       "test-cluster",
@@ -1492,7 +1559,8 @@ func TestDrainNode(t *testing.T) {
 			pods: []*corev1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "pod-1-skip-mirror-pod",
+						Name:      "pod-1-skip-mirror-pod",
+						Namespace: "test-namespace",
 						Annotations: map[string]string{
 							corev1.MirrorPodAnnotationKey: "some-value",
 						},
@@ -1500,7 +1568,8 @@ func TestDrainNode(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "pod-4-skip-daemonset-pod",
+						Name:      "pod-4-skip-daemonset-pod",
+						Namespace: "test-namespace",
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind:       "DaemonSet",
@@ -1529,7 +1598,8 @@ func TestDrainNode(t *testing.T) {
 			pods: []*corev1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "pod-1-skip-mirror-pod",
+						Name:      "pod-1-skip-mirror-pod",
+						Namespace: "test-namespace",
 						Annotations: map[string]string{
 							corev1.MirrorPodAnnotationKey: "some-value",
 						},
@@ -1537,7 +1607,8 @@ func TestDrainNode(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "pod-2-delete-running-deployment-pod",
+						Name:      "pod-2-delete-running-deployment-pod",
+						Namespace: "test-namespace",
 						OwnerReferences: []metav1.OwnerReference{
 							{
 								Kind:       "Deployment",
@@ -1558,11 +1629,11 @@ func TestDrainNode(t *testing.T) {
 				Severity: clusterv1.ConditionSeverityInfo,
 				Reason:   clusterv1.DrainingReason,
 				Message: `Drain not completed yet (started at 2024-10-09T16:13:59Z):
-* Pods with deletionTimestamp that still exist: pod-2-delete-running-deployment-pod`,
+* Pod test-namespace/pod-2-delete-running-deployment-pod: deletionTimestamp set, but still not removed from the Node`,
 			},
 			wantDeletingReason: clusterv1.MachineDeletingDrainingNodeV1Beta2Reason,
 			wantDeletingMessage: `Drain not completed yet (started at 2024-10-09T16:13:59Z):
-* Pods with deletionTimestamp that still exist: pod-2-delete-running-deployment-pod`,
+* Pod test-namespace/pod-2-delete-running-deployment-pod: deletionTimestamp set, but still not removed from the Node`,
 		},
 		{
 			name:     "Node does exist but is unreachable, no Pods have to be drained because they all have old deletionTimestamps",
@@ -1587,6 +1658,7 @@ func TestDrainNode(t *testing.T) {
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:              "pod-1-skip-pod-old-deletionTimestamp",
+						Namespace:         "test-namespace",
 						DeletionTimestamp: &metav1.Time{Time: time.Now().Add(time.Duration(1) * time.Hour * -1)},
 						Finalizers:        []string{"block-deletion"},
 					},
@@ -1621,7 +1693,15 @@ func TestDrainNode(t *testing.T) {
 			}
 			remoteObjs = append(remoteObjs, &appsv1.DaemonSet{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "daemonset-does-exist",
+					Name:      "daemonset-does-exist",
+					Namespace: "test-namespace",
+				},
+			}, &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-namespace",
+					Labels: map[string]string{
+						"kubernetes.io/metadata.name": "test-namespace",
+					},
 				},
 			})
 			remoteClient := fake.NewClientBuilder().
@@ -1718,7 +1798,8 @@ func TestDrainNode_withCaching(t *testing.T) {
 	pods := []*corev1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "pod-delete-running-deployment-pod",
+				Name:      "pod-delete-running-deployment-pod",
+				Namespace: "test-namespace",
 				Finalizers: []string{
 					// Add a finalizer so the Pod doesn't go away after eviction.
 					"cluster.x-k8s.io/block",
@@ -1738,6 +1819,14 @@ func TestDrainNode_withCaching(t *testing.T) {
 			},
 		},
 	}
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-namespace",
+			Labels: map[string]string{
+				"kubernetes.io/metadata.name": "test-namespace",
+			},
+		},
+	}
 
 	var objs []client.Object
 	objs = append(objs, testCluster, testMachine)
@@ -1745,7 +1834,7 @@ func TestDrainNode_withCaching(t *testing.T) {
 		WithObjects(objs...).
 		Build()
 
-	remoteObjs := []client.Object{node}
+	remoteObjs := []client.Object{node, ns}
 	for _, p := range pods {
 		remoteObjs = append(remoteObjs, p)
 	}
@@ -1781,11 +1870,11 @@ func TestDrainNode_withCaching(t *testing.T) {
 		Severity: clusterv1.ConditionSeverityInfo,
 		Reason:   clusterv1.DrainingReason,
 		Message: `Drain not completed yet (started at 2024-10-09T16:13:59Z):
-* Pods with deletionTimestamp that still exist: pod-delete-running-deployment-pod`,
+* Pod test-namespace/pod-delete-running-deployment-pod: deletionTimestamp set, but still not removed from the Node`,
 	}))
 	g.Expect(s.deletingReason).To(Equal(clusterv1.MachineDeletingDrainingNodeV1Beta2Reason))
 	g.Expect(s.deletingMessage).To(Equal(`Drain not completed yet (started at 2024-10-09T16:13:59Z):
-* Pods with deletionTimestamp that still exist: pod-delete-running-deployment-pod`))
+* Pod test-namespace/pod-delete-running-deployment-pod: deletionTimestamp set, but still not removed from the Node`))
 
 	// Node should be cordoned.
 	gotNode := &corev1.Node{}
@@ -1818,6 +1907,55 @@ func TestIsNodeVolumeDetachingAllowed(t *testing.T) {
 					Namespace:   metav1.NamespaceDefault,
 					Finalizers:  []string{clusterv1.MachineFinalizer},
 					Annotations: map[string]string{clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation: "existed!!"},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: false,
+		},
+		{
+			name: "KCP machine with the pre terminate hook should wait",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-machine",
+					Namespace:   metav1.NamespaceDefault,
+					Labels:      map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					Annotations: map[string]string{KubeadmControlPlanePreTerminateHookCleanupAnnotation: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: clusterv1.GroupVersion.String(),
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: true,
+		},
+		{
+			name: "KCP machine without the pre terminate hook should stop waiting",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-machine",
+					Namespace: metav1.NamespaceDefault,
+					Labels:    map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: clusterv1.GroupVersion.String(),
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
 				},
 				Spec: clusterv1.MachineSpec{
 					ClusterName:       "test-cluster",
@@ -1984,7 +2122,8 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 	tests := []struct {
 		name                    string
 		node                    *corev1.Node
-		objs                    []client.Object
+		remoteObjects           []client.Object
+		featureGateDisabled     bool
 		expected                ctrl.Result
 		expectedDeletingReason  string
 		expectedDeletingMessage string
@@ -2005,7 +2144,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					VolumesAttached: attachedVolumes,
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				persistentVolume,
 			},
 			expected:               ctrl.Result{RequeueAfter: waitForVolumeDetachRetryInterval},
@@ -2029,7 +2168,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					VolumesAttached: attachedVolumes,
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				persistentVolumeWithoutClaim,
 			},
 			expected:               ctrl.Result{RequeueAfter: waitForVolumeDetachRetryInterval},
@@ -2053,7 +2192,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					VolumesAttached: attachedVolumes,
 				},
 			},
-			objs:                   []client.Object{},
+			remoteObjects:          []client.Object{},
 			expected:               ctrl.Result{RequeueAfter: waitForVolumeDetachRetryInterval},
 			expectedDeletingReason: clusterv1.MachineDeletingWaitingForVolumeDetachV1Beta2Reason,
 			expectedDeletingMessage: `Waiting for Node volumes to be detached (started at 2024-10-09T16:13:59Z)
@@ -2075,7 +2214,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					VolumesAttached: attachedVolumes,
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test-pod",
@@ -2127,7 +2266,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					},
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				volumeAttachment,
 				persistentVolume,
 			},
@@ -2135,6 +2274,28 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 			expectedDeletingReason: clusterv1.MachineDeletingWaitingForVolumeDetachV1Beta2Reason,
 			expectedDeletingMessage: `Waiting for Node volumes to be detached (started at 2024-10-09T16:13:59Z)
 * PersistentVolumeClaims: default/test-pvc`,
+		},
+		{
+			name: "Node has volumes attached according to volumeattachments (but ignored because feature gate is disabled)",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nodeName,
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:   corev1.NodeReady,
+							Status: corev1.ConditionTrue,
+						},
+					},
+				},
+			},
+			remoteObjects: []client.Object{
+				volumeAttachment,
+				persistentVolume,
+			},
+			featureGateDisabled: true,
+			expected:            ctrl.Result{},
 		},
 		{
 			name: "Node has volumes attached according to volumeattachments but without a pv",
@@ -2151,7 +2312,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					},
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				volumeAttachment,
 			},
 			expected:               ctrl.Result{RequeueAfter: waitForVolumeDetachRetryInterval},
@@ -2174,7 +2335,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					},
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				volumeAttachment,
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2228,7 +2389,7 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 					VolumesAttached: attachedVolumes,
 				},
 			},
-			objs: []client.Object{
+			remoteObjects: []client.Object{
 				volumeAttachment,
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2317,15 +2478,29 @@ func TestShouldWaitForNodeVolumes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			var objs []client.Object
-			objs = append(objs, testCluster, tt.node)
-			objs = append(objs, tt.objs...)
+			if tt.featureGateDisabled {
+				utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.MachineWaitForVolumeDetachConsiderVolumeAttachments, false)
+			}
 
-			c := fake.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", nodeNameIndex).
-				WithObjects(objs...).Build()
+			fakeClient := fake.NewClientBuilder().WithObjects(testCluster).Build()
+
+			var remoteObjects []client.Object
+			remoteObjects = append(remoteObjects, tt.node)
+			remoteObjects = append(remoteObjects, tt.remoteObjects...)
+			remoteObjects = append(remoteObjects, &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "default",
+					Labels: map[string]string{
+						"kubernetes.io/metadata.name": "default",
+					},
+				},
+			})
+			remoteFakeClient := fake.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", nodeNameIndex).
+				WithObjects(remoteObjects...).Build()
+
 			r := &Reconciler{
-				Client:               c,
-				ClusterCache:         clustercache.NewFakeClusterCache(c, client.ObjectKeyFromObject(testCluster)),
+				Client:               fakeClient,
+				ClusterCache:         clustercache.NewFakeClusterCache(remoteFakeClient, client.ObjectKeyFromObject(testCluster)),
 				reconcileDeleteCache: cache.New[cache.ReconcileEntry](),
 			}
 
@@ -2856,12 +3031,14 @@ func TestNodeToMachine(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -3033,6 +3210,7 @@ func TestNodeDeletion(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 		},
@@ -3229,6 +3407,7 @@ func TestNodeDeletionWithoutNodeRefFallback(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap:  clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 			ProviderID: ptr.To("test://id-1"),

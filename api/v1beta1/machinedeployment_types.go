@@ -107,6 +107,16 @@ const (
 	// MachineDeploymentMachinesReadyV1Beta2Condition surfaces detail of issues on the controlled machines, if any.
 	MachineDeploymentMachinesReadyV1Beta2Condition = MachinesReadyV1Beta2Condition
 
+	// MachineDeploymentMachinesReadyV1Beta2Reason surfaces when all the controlled machine's Ready conditions are true.
+	MachineDeploymentMachinesReadyV1Beta2Reason = ReadyV1Beta2Reason
+
+	// MachineDeploymentMachinesNotReadyV1Beta2Reason surfaces when at least one of the controlled machine's Ready conditions is false.
+	MachineDeploymentMachinesNotReadyV1Beta2Reason = NotReadyV1Beta2Reason
+
+	// MachineDeploymentMachinesReadyUnknownV1Beta2Reason surfaces when at least one of the controlled machine's Ready conditions is unknown
+	// and none of the controlled machine's Ready conditions is false.
+	MachineDeploymentMachinesReadyUnknownV1Beta2Reason = ReadyUnknownV1Beta2Reason
+
 	// MachineDeploymentMachinesReadyNoReplicasV1Beta2Reason surfaces when no machines exist for the MachineDeployment.
 	MachineDeploymentMachinesReadyNoReplicasV1Beta2Reason = NoReplicasV1Beta2Reason
 
@@ -120,12 +130,37 @@ const (
 	// MachineDeploymentMachinesUpToDateV1Beta2Condition surfaces details of controlled machines not up to date, if any.
 	MachineDeploymentMachinesUpToDateV1Beta2Condition = MachinesUpToDateV1Beta2Condition
 
+	// MachineDeploymentMachinesUpToDateV1Beta2Reason surfaces when all the controlled machine's UpToDate conditions are true.
+	MachineDeploymentMachinesUpToDateV1Beta2Reason = UpToDateV1Beta2Reason
+
+	// MachineDeploymentMachinesNotUpToDateV1Beta2Reason surfaces when at least one of the controlled machine's UpToDate conditions is false.
+	MachineDeploymentMachinesNotUpToDateV1Beta2Reason = NotUpToDateV1Beta2Reason
+
+	// MachineDeploymentMachinesUpToDateUnknownV1Beta2Reason surfaces when at least one of the controlled machine's UpToDate conditions is unknown
+	// and none of the controlled machine's UpToDate conditions is false.
+	MachineDeploymentMachinesUpToDateUnknownV1Beta2Reason = UpToDateUnknownV1Beta2Reason
+
 	// MachineDeploymentMachinesUpToDateNoReplicasV1Beta2Reason surfaces when no machines exist for the MachineDeployment.
 	MachineDeploymentMachinesUpToDateNoReplicasV1Beta2Reason = NoReplicasV1Beta2Reason
 
 	// MachineDeploymentMachinesUpToDateInternalErrorV1Beta2Reason surfaces unexpected failures when listing machines
 	// or aggregating status.
 	MachineDeploymentMachinesUpToDateInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
+)
+
+// MachineDeployment's RollingOut condition and corresponding reasons that will be used in v1Beta2 API version.
+const (
+	// MachineDeploymentRollingOutV1Beta2Condition is true if there is at least one machine not up-to-date.
+	MachineDeploymentRollingOutV1Beta2Condition = RollingOutV1Beta2Condition
+
+	// MachineDeploymentRollingOutV1Beta2Reason surfaces when there is at least one machine not up-to-date.
+	MachineDeploymentRollingOutV1Beta2Reason = RollingOutV1Beta2Reason
+
+	// MachineDeploymentNotRollingOutV1Beta2Reason surfaces when all the machines are up-to-date.
+	MachineDeploymentNotRollingOutV1Beta2Reason = NotRollingOutV1Beta2Reason
+
+	// MachineDeploymentRollingOutInternalErrorV1Beta2Reason surfaces unexpected failures when listing machines.
+	MachineDeploymentRollingOutInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
 )
 
 // MachineDeployment's ScalingUp condition and corresponding reasons that will be used in v1Beta2 API version.
@@ -188,13 +223,13 @@ const (
 	// MachineDeploymentDeletingV1Beta2Condition surfaces details about ongoing deletion of the controlled machines.
 	MachineDeploymentDeletingV1Beta2Condition = DeletingV1Beta2Condition
 
-	// MachineDeploymentDeletingDeletionTimestampNotSetV1Beta2Reason surfaces when the MachineDeployment is not deleting because the
+	// MachineDeploymentNotDeletingV1Beta2Reason surfaces when the MachineDeployment is not deleting because the
 	// DeletionTimestamp is not set.
-	MachineDeploymentDeletingDeletionTimestampNotSetV1Beta2Reason = DeletionTimestampNotSetV1Beta2Reason
+	MachineDeploymentNotDeletingV1Beta2Reason = NotDeletingV1Beta2Reason
 
-	// MachineDeploymentDeletingDeletionTimestampSetV1Beta2Reason surfaces when the MachineDeployment is deleting because the
+	// MachineDeploymentDeletingV1Beta2Reason surfaces when the MachineDeployment is deleting because the
 	// DeletionTimestamp is set.
-	MachineDeploymentDeletingDeletionTimestampSetV1Beta2Reason = DeletionTimestampSetV1Beta2Reason
+	MachineDeploymentDeletingV1Beta2Reason = DeletingV1Beta2Reason
 
 	// MachineDeploymentDeletingInternalErrorV1Beta2Reason surfaces unexpected failures when deleting a MachineDeployment.
 	MachineDeploymentDeletingInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
@@ -204,7 +239,7 @@ const (
 
 // MachineDeploymentSpec defines the desired state of MachineDeployment.
 type MachineDeploymentSpec struct {
-	// ClusterName is the name of the Cluster this object belongs to.
+	// clusterName is the name of the Cluster this object belongs to.
 	// +kubebuilder:validation:MinLength=1
 	ClusterName string `json:"clusterName"`
 
@@ -228,7 +263,7 @@ type MachineDeploymentSpec struct {
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// RolloutAfter is a field to indicate a rollout should be performed
+	// rolloutAfter is a field to indicate a rollout should be performed
 	// after the specified time even if no changes have been made to the
 	// MachineDeployment.
 	// Example: In the YAML the time can be specified in the RFC3339 format.
@@ -242,7 +277,7 @@ type MachineDeploymentSpec struct {
 	// It must match the machine template's labels.
 	Selector metav1.LabelSelector `json:"selector"`
 
-	// Template describes the machines that will be created.
+	// template describes the machines that will be created.
 	Template MachineTemplateSpec `json:"template"`
 
 	// The deployment strategy to use to replace existing machines with
@@ -250,7 +285,7 @@ type MachineDeploymentSpec struct {
 	// +optional
 	Strategy *MachineDeploymentStrategy `json:"strategy,omitempty"`
 
-	// MinReadySeconds is the minimum number of seconds for which a Node for a newly created machine should be ready before considering the replica available.
+	// minReadySeconds is the minimum number of seconds for which a Node for a newly created machine should be ready before considering the replica available.
 	// Defaults to 0 (machine will be considered available as soon as the Node is ready)
 	// +optional
 	MinReadySeconds *int32 `json:"minReadySeconds,omitempty"`
@@ -284,7 +319,7 @@ type MachineDeploymentSpec struct {
 // MachineDeploymentStrategy describes how to replace existing machines
 // with new ones.
 type MachineDeploymentStrategy struct {
-	// Type of deployment. Allowed values are RollingUpdate and OnDelete.
+	// type of deployment. Allowed values are RollingUpdate and OnDelete.
 	// The default is RollingUpdate.
 	// +kubebuilder:validation:Enum=RollingUpdate;OnDelete
 	// +optional
@@ -295,7 +330,7 @@ type MachineDeploymentStrategy struct {
 	// +optional
 	RollingUpdate *MachineRollingUpdateDeployment `json:"rollingUpdate,omitempty"`
 
-	// Remediation controls the strategy of remediating unhealthy machines
+	// remediation controls the strategy of remediating unhealthy machines
 	// and how remediating operations should occur during the lifecycle of the dependant MachineSets.
 	// +optional
 	Remediation *RemediationStrategy `json:"remediation,omitempty"`
@@ -338,7 +373,7 @@ type MachineRollingUpdateDeployment struct {
 	// +optional
 	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
 
-	// DeletePolicy defines the policy used by the MachineDeployment to identify nodes to delete when downscaling.
+	// deletePolicy defines the policy used by the MachineDeployment to identify nodes to delete when downscaling.
 	// Valid values are "Random, "Newest", "Oldest"
 	// When no value is supplied, the default DeletePolicy of MachineSet is used
 	// +kubebuilder:validation:Enum=Random;Newest;Oldest
@@ -352,7 +387,7 @@ type MachineRollingUpdateDeployment struct {
 
 // RemediationStrategy allows to define how the MachineSet can control scaling operations.
 type RemediationStrategy struct {
-	// MaxInFlight determines how many in flight remediations should happen at the same time.
+	// maxInFlight determines how many in flight remediations should happen at the same time.
 	//
 	// Remediation only happens on the MachineSet with the most current revision, while
 	// older MachineSets (usually present during rollout operations) aren't allowed to remediate.
@@ -381,7 +416,7 @@ type MachineDeploymentStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Selector is the same as the label selector but in the string format to avoid introspection
+	// selector is the same as the label selector but in the string format to avoid introspection
 	// by clients. The string will be in the same format as the query-param syntax.
 	// More info about label selectors: http://kubernetes.io/docs/user-guide/labels#label-selectors
 	// +optional
@@ -414,11 +449,11 @@ type MachineDeploymentStatus struct {
 	// +optional
 	UnavailableReplicas int32 `json:"unavailableReplicas"`
 
-	// Phase represents the current phase of a MachineDeployment (ScalingUp, ScalingDown, Running, Failed, or Unknown).
+	// phase represents the current phase of a MachineDeployment (ScalingUp, ScalingDown, Running, Failed, or Unknown).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// Conditions defines current service state of the MachineDeployment.
+	// conditions defines current service state of the MachineDeployment.
 	// +optional
 	Conditions Conditions `json:"conditions,omitempty"`
 
@@ -550,7 +585,7 @@ func (m *MachineDeployment) GetV1Beta2Conditions() []metav1.Condition {
 
 // SetV1Beta2Conditions sets conditions for an API object.
 func (m *MachineDeployment) SetV1Beta2Conditions(conditions []metav1.Condition) {
-	if m.Status.V1Beta2 == nil && conditions != nil {
+	if m.Status.V1Beta2 == nil {
 		m.Status.V1Beta2 = &MachineDeploymentV1Beta2Status{}
 	}
 	m.Status.V1Beta2.Conditions = conditions

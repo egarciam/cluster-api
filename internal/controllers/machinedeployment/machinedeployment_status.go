@@ -25,6 +25,7 @@ import (
 
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -60,6 +61,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, s *scope) (retErr error) 
 
 	setAvailableCondition(ctx, s.machineDeployment, s.getAndAdoptMachineSetsForDeploymentSucceeded)
 
+	setRollingOutCondition(ctx, s.machineDeployment, machines, getMachinesSucceeded)
 	setScalingUpCondition(ctx, s.machineDeployment, s.machineSets, s.bootstrapTemplateNotFound, s.infrastructureTemplateNotFound, s.getAndAdoptMachineSetsForDeploymentSucceeded)
 	setScalingDownCondition(ctx, s.machineDeployment, s.machineSets, machines, s.getAndAdoptMachineSetsForDeploymentSucceeded, getMachinesSucceeded)
 
@@ -104,9 +106,10 @@ func setAvailableCondition(_ context.Context, machineDeployment *clusterv1.Machi
 	// Surface if .spec.replicas is not yet set (this should never happen).
 	if machineDeployment.Spec.Replicas == nil {
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
-			Type:   clusterv1.MachineDeploymentAvailableV1Beta2Condition,
-			Status: metav1.ConditionUnknown,
-			Reason: clusterv1.MachineDeploymentAvailableWaitingForReplicasSetV1Beta2Reason,
+			Type:    clusterv1.MachineDeploymentAvailableV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.MachineDeploymentAvailableWaitingForReplicasSetV1Beta2Reason,
+			Message: "Waiting for spec.replicas set",
 		})
 		return
 	}
@@ -114,9 +117,10 @@ func setAvailableCondition(_ context.Context, machineDeployment *clusterv1.Machi
 	// Surface if .status.v1beta2.availableReplicas is not yet set.
 	if machineDeployment.Status.V1Beta2 == nil || machineDeployment.Status.V1Beta2.AvailableReplicas == nil {
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
-			Type:   clusterv1.MachineDeploymentAvailableV1Beta2Condition,
-			Status: metav1.ConditionUnknown,
-			Reason: clusterv1.MachineDeploymentAvailableWaitingForAvailableReplicasSetV1Beta2Reason,
+			Type:    clusterv1.MachineDeploymentAvailableV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.MachineDeploymentAvailableWaitingForAvailableReplicasSetV1Beta2Reason,
+			Message: "Waiting for status.v1beta2.availableReplicas set",
 		})
 		return
 	}
@@ -145,6 +149,74 @@ func setAvailableCondition(_ context.Context, machineDeployment *clusterv1.Machi
 	})
 }
 
+func setRollingOutCondition(_ context.Context, machineDeployment *clusterv1.MachineDeployment, machines collections.Machines, getMachinesSucceeded bool) {
+	// If we got unexpected errors in listing the machines (this should never happen), surface them.
+	if !getMachinesSucceeded {
+		v1beta2conditions.Set(machineDeployment, metav1.Condition{
+			Type:    clusterv1.MachineDeploymentRollingOutV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.MachineDeploymentRollingOutInternalErrorV1Beta2Reason,
+			Message: "Please check controller logs for errors",
+		})
+		return
+	}
+
+	// Count machines rolling out and collect reasons why a rollout is happening.
+	// Note: The code below collects all the reasons for which at least a machine is rolling out; under normal circumstances
+	// all the machines are rolling out for the same reasons, however, in case of changes to
+	// the MD before a previous changes is not fully rolled out, there could be machines rolling out for
+	// different reasons.
+	rollingOutReplicas := 0
+	rolloutReasons := sets.Set[string]{}
+	for _, machine := range machines {
+		upToDateCondition := v1beta2conditions.Get(machine, clusterv1.MachineUpToDateV1Beta2Condition)
+		if upToDateCondition == nil || upToDateCondition.Status != metav1.ConditionFalse {
+			continue
+		}
+		rollingOutReplicas++
+		if upToDateCondition.Message != "" {
+			rolloutReasons.Insert(strings.Split(upToDateCondition.Message, "; ")...)
+		}
+	}
+
+	if rollingOutReplicas == 0 {
+		var message string
+		v1beta2conditions.Set(machineDeployment, metav1.Condition{
+			Type:    clusterv1.MachineDeploymentRollingOutV1Beta2Condition,
+			Status:  metav1.ConditionFalse,
+			Reason:  clusterv1.MachineDeploymentNotRollingOutV1Beta2Reason,
+			Message: message,
+		})
+		return
+	}
+
+	// Rolling out.
+	message := fmt.Sprintf("Rolling out %d not up-to-date replicas", rollingOutReplicas)
+	if rolloutReasons.Len() > 0 {
+		// Surface rollout reasons ensuring that if there is a version change, it goes first.
+		reasons := rolloutReasons.UnsortedList()
+		sort.Slice(reasons, func(i, j int) bool {
+			if strings.HasPrefix(reasons[i], "Version") && !strings.HasPrefix(reasons[j], "Version") {
+				return true
+			}
+			if !strings.HasPrefix(reasons[i], "Version") && strings.HasPrefix(reasons[j], "Version") {
+				return false
+			}
+			return reasons[i] < reasons[j]
+		})
+		for i := range reasons {
+			reasons[i] = fmt.Sprintf("* %s", reasons[i])
+		}
+		message += fmt.Sprintf("\n%s", strings.Join(reasons, "\n"))
+	}
+	v1beta2conditions.Set(machineDeployment, metav1.Condition{
+		Type:    clusterv1.MachineDeploymentRollingOutV1Beta2Condition,
+		Status:  metav1.ConditionTrue,
+		Reason:  clusterv1.MachineDeploymentRollingOutV1Beta2Reason,
+		Message: message,
+	})
+}
+
 func setScalingUpCondition(_ context.Context, machineDeployment *clusterv1.MachineDeployment, machineSets []*clusterv1.MachineSet, bootstrapObjectNotFound, infrastructureObjectNotFound, getAndAdoptMachineSetsForDeploymentSucceeded bool) {
 	// If we got unexpected errors in listing the machine sets (this should never happen), surface them.
 	if !getAndAdoptMachineSetsForDeploymentSucceeded {
@@ -160,9 +232,10 @@ func setScalingUpCondition(_ context.Context, machineDeployment *clusterv1.Machi
 	// Surface if .spec.replicas is not yet set (this should never happen).
 	if machineDeployment.Spec.Replicas == nil {
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
-			Type:   clusterv1.MachineDeploymentScalingUpV1Beta2Condition,
-			Status: metav1.ConditionUnknown,
-			Reason: clusterv1.MachineDeploymentScalingUpWaitingForReplicasSetV1Beta2Reason,
+			Type:    clusterv1.MachineDeploymentScalingUpV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.MachineDeploymentScalingUpWaitingForReplicasSetV1Beta2Reason,
+			Message: "Waiting for spec.replicas set",
 		})
 		return
 	}
@@ -177,7 +250,8 @@ func setScalingUpCondition(_ context.Context, machineDeployment *clusterv1.Machi
 
 	if currentReplicas >= desiredReplicas {
 		var message string
-		if missingReferencesMessage != "" {
+		// Only surface this message if the MachineDeployment is not deleting.
+		if machineDeployment.DeletionTimestamp.IsZero() && missingReferencesMessage != "" {
 			message = fmt.Sprintf("Scaling up would be blocked %s", missingReferencesMessage)
 		}
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
@@ -217,9 +291,10 @@ func setScalingDownCondition(_ context.Context, machineDeployment *clusterv1.Mac
 	// Surface if .spec.replicas is not yet set (this should never happen).
 	if machineDeployment.Spec.Replicas == nil {
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
-			Type:   clusterv1.MachineDeploymentScalingDownV1Beta2Condition,
-			Status: metav1.ConditionUnknown,
-			Reason: clusterv1.MachineDeploymentScalingDownWaitingForReplicasSetV1Beta2Reason,
+			Type:    clusterv1.MachineDeploymentScalingDownV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.MachineDeploymentScalingDownWaitingForReplicasSetV1Beta2Reason,
+			Message: "Waiting for spec.replicas set",
 		})
 		return
 	}
@@ -236,7 +311,7 @@ func setScalingDownCondition(_ context.Context, machineDeployment *clusterv1.Mac
 		if getMachinesSucceeded {
 			staleMessage := aggregateStaleMachines(machines)
 			if staleMessage != "" {
-				message += fmt.Sprintf(" and %s", staleMessage)
+				message += fmt.Sprintf("\n* %s", staleMessage)
 			}
 		}
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
@@ -281,6 +356,16 @@ func setMachinesReadyCondition(ctx context.Context, machineDeployment *clusterv1
 	readyCondition, err := v1beta2conditions.NewAggregateCondition(
 		machines.UnsortedList(), clusterv1.MachineReadyV1Beta2Condition,
 		v1beta2conditions.TargetConditionType(clusterv1.MachineDeploymentMachinesReadyV1Beta2Condition),
+		// Using a custom merge strategy to override reasons applied during merge.
+		v1beta2conditions.CustomMergeStrategy{
+			MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
+				v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
+					clusterv1.MachineDeploymentMachinesNotReadyV1Beta2Reason,
+					clusterv1.MachineDeploymentMachinesReadyUnknownV1Beta2Reason,
+					clusterv1.MachineDeploymentMachinesReadyV1Beta2Reason,
+				)),
+			),
+		},
 	)
 	if err != nil {
 		log.Error(err, "Failed to aggregate Machine's Ready conditions")
@@ -309,6 +394,13 @@ func setMachinesUpToDateCondition(ctx context.Context, machineDeployment *cluste
 		return
 	}
 
+	// Only consider Machines that have an UpToDate condition or are older than 10s.
+	// This is done to ensure the MachinesUpToDate condition doesn't flicker after a new Machine is created,
+	// because it can take a bit until the UpToDate condition is set on a new Machine.
+	machines = machines.Filter(func(machine *clusterv1.Machine) bool {
+		return v1beta2conditions.Has(machine, clusterv1.MachineUpToDateV1Beta2Condition) || time.Since(machine.CreationTimestamp.Time) > 10*time.Second
+	})
+
 	if len(machines) == 0 {
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
 			Type:   clusterv1.MachineDeploymentMachinesUpToDateV1Beta2Condition,
@@ -321,6 +413,16 @@ func setMachinesUpToDateCondition(ctx context.Context, machineDeployment *cluste
 	upToDateCondition, err := v1beta2conditions.NewAggregateCondition(
 		machines.UnsortedList(), clusterv1.MachineUpToDateV1Beta2Condition,
 		v1beta2conditions.TargetConditionType(clusterv1.MachineDeploymentMachinesUpToDateV1Beta2Condition),
+		// Using a custom merge strategy to override reasons applied during merge.
+		v1beta2conditions.CustomMergeStrategy{
+			MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
+				v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
+					clusterv1.MachineDeploymentMachinesNotUpToDateV1Beta2Reason,
+					clusterv1.MachineDeploymentMachinesUpToDateUnknownV1Beta2Reason,
+					clusterv1.MachineDeploymentMachinesUpToDateV1Beta2Reason,
+				)),
+			),
+		},
 	)
 	if err != nil {
 		log.Error(err, "Failed to aggregate Machine's UpToDate conditions")
@@ -361,6 +463,8 @@ func setRemediatingCondition(ctx context.Context, machineDeployment *clusterv1.M
 	remediatingCondition, err := v1beta2conditions.NewAggregateCondition(
 		machinesToBeRemediated.UnsortedList(), clusterv1.MachineOwnerRemediatedV1Beta2Condition,
 		v1beta2conditions.TargetConditionType(clusterv1.MachineDeploymentRemediatingV1Beta2Condition),
+		// Note: in case of the remediating conditions it is not required to use a CustomMergeStrategy/ComputeReasonFunc
+		// because we are considering only machinesToBeRemediated (and we can pin the reason when we set the condition).
 	)
 	if err != nil {
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
@@ -399,7 +503,7 @@ func setDeletingCondition(_ context.Context, machineDeployment *clusterv1.Machin
 		v1beta2conditions.Set(machineDeployment, metav1.Condition{
 			Type:   clusterv1.MachineDeploymentDeletingV1Beta2Condition,
 			Status: metav1.ConditionFalse,
-			Reason: clusterv1.MachineDeploymentDeletingDeletionTimestampNotSetV1Beta2Reason,
+			Reason: clusterv1.MachineDeploymentNotDeletingV1Beta2Reason,
 		})
 		return
 	}
@@ -413,17 +517,20 @@ func setDeletingCondition(_ context.Context, machineDeployment *clusterv1.Machin
 		}
 		staleMessage := aggregateStaleMachines(machines)
 		if staleMessage != "" {
-			message += fmt.Sprintf(" and %s", staleMessage)
+			message += fmt.Sprintf("\n* %s", staleMessage)
 		}
 	}
 	if len(machines) == 0 && len(machineSets) > 0 {
 		// Note: this should not happen or happen for a very short time while the finalizer is removed.
 		message = fmt.Sprintf("Deleting %d MachineSets", len(machineSets))
 	}
+	if message == "" {
+		message = "Deletion completed"
+	}
 	v1beta2conditions.Set(machineDeployment, metav1.Condition{
 		Type:    clusterv1.MachineDeploymentDeletingV1Beta2Condition,
 		Status:  metav1.ConditionTrue,
-		Reason:  clusterv1.MachineDeploymentDeletingDeletionTimestampSetV1Beta2Reason,
+		Reason:  clusterv1.MachineDeploymentDeletingV1Beta2Reason,
 		Message: message,
 	})
 }
@@ -454,9 +561,26 @@ func aggregateStaleMachines(machines collections.Machines) string {
 	}
 
 	machineNames := []string{}
+	delayReasons := sets.Set[string]{}
 	for _, machine := range machines {
-		if !machine.GetDeletionTimestamp().IsZero() && time.Since(machine.GetDeletionTimestamp().Time) > time.Minute*30 {
+		if !machine.GetDeletionTimestamp().IsZero() && time.Since(machine.GetDeletionTimestamp().Time) > time.Minute*15 {
 			machineNames = append(machineNames, machine.GetName())
+
+			deletingCondition := v1beta2conditions.Get(machine, clusterv1.MachineDeletingV1Beta2Condition)
+			if deletingCondition != nil &&
+				deletingCondition.Status == metav1.ConditionTrue &&
+				deletingCondition.Reason == clusterv1.MachineDeletingDrainingNodeV1Beta2Reason &&
+				machine.Status.Deletion != nil && time.Since(machine.Status.Deletion.NodeDrainStartTime.Time) > 5*time.Minute {
+				if strings.Contains(deletingCondition.Message, "cannot evict pod as it would violate the pod's disruption budget.") {
+					delayReasons.Insert("PodDisruptionBudgets")
+				}
+				if strings.Contains(deletingCondition.Message, "deletionTimestamp set, but still not removed from the Node") {
+					delayReasons.Insert("Pods not terminating")
+				}
+				if strings.Contains(deletingCondition.Message, "failed to evict Pod") {
+					delayReasons.Insert("Pod eviction errors")
+				}
+			}
 		}
 	}
 
@@ -477,7 +601,16 @@ func aggregateStaleMachines(machines collections.Machines) string {
 	} else {
 		message += " are "
 	}
-	message += "in deletion since more than 30m"
+	message += "in deletion since more than 15m"
+	if len(delayReasons) > 0 {
+		reasonList := []string{}
+		for _, r := range []string{"PodDisruptionBudgets", "Pods not terminating", "Pod eviction errors"} {
+			if delayReasons.Has(r) {
+				reasonList = append(reasonList, r)
+			}
+		}
+		message += fmt.Sprintf(", delay likely due to %s", strings.Join(reasonList, ", "))
+	}
 
 	return message
 }
@@ -487,10 +620,7 @@ func aggregateUnhealthyMachines(machines collections.Machines) string {
 		return ""
 	}
 
-	machineNames := []string{}
-	for _, machine := range machines {
-		machineNames = append(machineNames, machine.GetName())
-	}
+	machineNames := machines.Names()
 
 	if len(machineNames) == 0 {
 		return ""

@@ -92,9 +92,6 @@ const (
 	// Note: MinReadySeconds is assumed 0 until it will be implemented in v1beta2 API.
 	MachineAvailableV1Beta2Condition = AvailableV1Beta2Condition
 
-	// MachineNotReadyV1Beta2Reason surfaces when a machine is not ready (and thus not available).
-	MachineNotReadyV1Beta2Reason = "NotReady"
-
 	// MachineWaitingForMinReadySecondsV1Beta2Reason surfaces when a machine is ready for less than MinReadySeconds (and thus not yet available).
 	MachineWaitingForMinReadySecondsV1Beta2Reason = "WaitingForMinReadySeconds"
 
@@ -114,6 +111,17 @@ const (
 	// these conditions must be true as well.
 	MachineReadyV1Beta2Condition = ReadyV1Beta2Condition
 
+	// MachineReadyV1Beta2Reason surfaces when the machine readiness criteria is met.
+	MachineReadyV1Beta2Reason = ReadyV1Beta2Reason
+
+	// MachineNotReadyV1Beta2Reason surfaces when the machine readiness criteria is not met.
+	// Note: when a machine is not ready, it is also not available.
+	MachineNotReadyV1Beta2Reason = NotReadyV1Beta2Reason
+
+	// MachineReadyUnknownV1Beta2Reason surfaces when at least one machine readiness criteria is unknown
+	// and no machine readiness criteria is not met.
+	MachineReadyUnknownV1Beta2Reason = ReadyUnknownV1Beta2Reason
+
 	// MachineReadyInternalErrorV1Beta2Reason surfaces unexpected error when computing the Ready condition.
 	MachineReadyInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
 )
@@ -123,7 +131,15 @@ const (
 const (
 	// MachineUpToDateV1Beta2Condition is true if the Machine spec matches the spec of the Machine's owner resource, e.g. KubeadmControlPlane or MachineDeployment.
 	// The Machine's owner (e.g. MachineDeployment) is authoritative to set their owned Machine's UpToDate conditions based on its current spec.
+	// NOTE: The Machine's owner might use this condition to surface also other use cases when Machine is considered not up to date, e.g. when MachineDeployment spec.rolloutAfter
+	// is expired and the Machine needs to be rolled out.
 	MachineUpToDateV1Beta2Condition = "UpToDate"
+
+	// MachineUpToDateV1Beta2Reason surface when a Machine spec matches the spec of the Machine's owner resource, e.g. KubeadmControlPlane or MachineDeployment.
+	MachineUpToDateV1Beta2Reason = "UpToDate"
+
+	// MachineNotUpToDateV1Beta2Reason surface when a Machine spec does not match the spec of the Machine's owner resource, e.g. KubeadmControlPlane or MachineDeployment.
+	MachineNotUpToDateV1Beta2Reason = "NotUpToDate"
 )
 
 // Machine's BootstrapConfigReady condition and corresponding reasons that will be used in v1Beta2 API version.
@@ -136,12 +152,15 @@ const (
 	// from a BoostrapConfig object referenced from the machine).
 	MachineBootstrapDataSecretProvidedV1Beta2Reason = "DataSecretProvided"
 
+	// MachineBootstrapConfigReadyV1Beta2Reason surfaces when the machine bootstrap config is ready.
+	MachineBootstrapConfigReadyV1Beta2Reason = ReadyV1Beta2Reason
+
+	// MachineBootstrapConfigNotReadyV1Beta2Reason surfaces when the machine bootstrap config is not ready.
+	MachineBootstrapConfigNotReadyV1Beta2Reason = NotReadyV1Beta2Reason
+
 	// MachineBootstrapConfigInvalidConditionReportedV1Beta2Reason surfaces a BootstrapConfig Ready condition (read from a bootstrap config object) which is invalid.
 	// (e.g. its status is missing).
 	MachineBootstrapConfigInvalidConditionReportedV1Beta2Reason = InvalidConditionReportedV1Beta2Reason
-
-	// MachineBootstrapConfigReadyNoReasonReportedV1Beta2Reason applies to a BootstrapConfig Ready condition (read from a bootstrap config object) that reports no reason.
-	MachineBootstrapConfigReadyNoReasonReportedV1Beta2Reason = NoReasonReportedV1Beta2Reason
 
 	// MachineBootstrapConfigInternalErrorV1Beta2Reason surfaces unexpected failures when reading a BootstrapConfig object.
 	MachineBootstrapConfigInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
@@ -159,17 +178,20 @@ const (
 // Machine's InfrastructureReady condition and corresponding reasons that will be used in v1Beta2 API version.
 // Note: when possible, InfrastructureReady condition will use reasons surfaced from the underlying infra machine object.
 const (
-	// MachineInfrastructureReadyV1Beta2Condition mirrors the corresponding Ready condition from the Machine's Infrastructure resource.
+	// MachineInfrastructureReadyV1Beta2Condition mirrors the corresponding Ready condition from the Machine's infrastructure resource.
 	MachineInfrastructureReadyV1Beta2Condition = InfrastructureReadyV1Beta2Condition
+
+	// MachineInfrastructureReadyV1Beta2Reason surfaces when the machine infrastructure is ready.
+	MachineInfrastructureReadyV1Beta2Reason = ReadyV1Beta2Reason
+
+	// MachineInfrastructureNotReadyV1Beta2Reason surfaces when the machine infrastructure is not ready.
+	MachineInfrastructureNotReadyV1Beta2Reason = NotReadyV1Beta2Reason
 
 	// MachineInfrastructureInvalidConditionReportedV1Beta2Reason surfaces a infrastructure Ready condition (read from an infra machine object) which is invalid.
 	// (e.g. its status is missing).
 	MachineInfrastructureInvalidConditionReportedV1Beta2Reason = InvalidConditionReportedV1Beta2Reason
 
-	// MachineInfrastructureReadyNoReasonReportedV1Beta2Reason applies to a infrastructure Ready condition (read from an infra machine object) that reports no reason.
-	MachineInfrastructureReadyNoReasonReportedV1Beta2Reason = NoReasonReportedV1Beta2Reason
-
-	// MachineInfrastructureInternalErrorV1Beta2Reason surfaces unexpected failures when reading a infra machine object.
+	// MachineInfrastructureInternalErrorV1Beta2Reason surfaces unexpected failures when reading an infra machine object.
 	MachineInfrastructureInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
 
 	// MachineInfrastructureDoesNotExistV1Beta2Reason surfaces when a referenced infrastructure object does not exist.
@@ -191,20 +213,36 @@ const (
 	// MachineNodeReadyV1Beta2Condition is true if the Machine's Node is ready.
 	MachineNodeReadyV1Beta2Condition = "NodeReady"
 
-	// MachineNodeConditionNotYetReportedV1Beta2Reason surfaces when a Machine's Node doesn't have a condition reported yet.
-	MachineNodeConditionNotYetReportedV1Beta2Reason = "NodeConditionNotYetReported"
+	// MachineNodeReadyV1Beta2Reason surfaces when Machine's Node Ready condition is true.
+	MachineNodeReadyV1Beta2Reason = "NodeReady"
+
+	// MachineNodeNotReadyV1Beta2Reason surfaces when Machine's Node Ready condition is false.
+	MachineNodeNotReadyV1Beta2Reason = "NodeNotReady"
+
+	// MachineNodeReadyUnknownV1Beta2Reason surfaces when Machine's Node Ready condition is unknown.
+	MachineNodeReadyUnknownV1Beta2Reason = "NodeReadyUnknown"
+
+	// MachineNodeHealthyV1Beta2Reason surfaces when all the node conditions report healthy state.
+	MachineNodeHealthyV1Beta2Reason = "NodeHealthy"
+
+	// MachineNodeNotHealthyV1Beta2Reason surfaces when at least one node conditions report not healthy state.
+	MachineNodeNotHealthyV1Beta2Reason = "NodeNotHealthy"
+
+	// MachineNodeHealthUnknownV1Beta2Reason surfaces when at least one node conditions report healthy state unknown
+	// and no node conditions report not healthy state.
+	MachineNodeHealthUnknownV1Beta2Reason = "NodeHealthyUnknown"
 
 	// MachineNodeInternalErrorV1Beta2Reason surfaces unexpected failures when reading a Node object.
 	MachineNodeInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
 
 	// MachineNodeDoesNotExistV1Beta2Reason surfaces when the node hosted on the machine does not exist.
 	// Note: this could happen when creating the machine. However, this state should be treated as an error if it lasts indefinitely.
-	MachineNodeDoesNotExistV1Beta2Reason = ObjectDoesNotExistV1Beta2Reason
+	MachineNodeDoesNotExistV1Beta2Reason = "NodeDoesNotExist"
 
 	// MachineNodeDeletedV1Beta2Reason surfaces when the node hosted on the machine has been deleted.
 	// Note: controllers can't identify if the Node was deleted by the controller itself, e.g.
 	// during the deletion workflow, or by a users.
-	MachineNodeDeletedV1Beta2Reason = ObjectDeletedV1Beta2Reason
+	MachineNodeDeletedV1Beta2Reason = "NodeDeleted"
 
 	// MachineNodeInspectionFailedV1Beta2Reason documents a failure when inspecting the status of a Node.
 	MachineNodeInspectionFailedV1Beta2Reason = InspectionFailedV1Beta2Reason
@@ -279,18 +317,13 @@ const (
 	// MachineDeletingV1Beta2Condition surfaces details about progress in the machine deletion workflow.
 	MachineDeletingV1Beta2Condition = DeletingV1Beta2Condition
 
-	// MachineDeletingV1Beta2Reason surfaces when the Machine is deleting.
-	// This reason is only used for the MachineDeletingV1Beta2Condition when calculating the
-	// Ready condition when the deletionTimestamp on a Machine is set.
-	MachineDeletingV1Beta2Reason = "Deleting"
-
-	// MachineDeletingDeletionTimestampNotSetV1Beta2Reason surfaces when the Machine is not deleting because the
+	// MachineNotDeletingV1Beta2Reason surfaces when the Machine is not deleting because the
 	// DeletionTimestamp is not set.
-	MachineDeletingDeletionTimestampNotSetV1Beta2Reason = DeletionTimestampNotSetV1Beta2Reason
+	MachineNotDeletingV1Beta2Reason = NotDeletingV1Beta2Reason
 
-	// MachineDeletingDeletionTimestampSetV1Beta2Reason surfaces when the Machine is deleting because the
+	// MachineDeletingV1Beta2Reason surfaces when the Machine is deleting because the
 	// DeletionTimestamp is set. This reason is used if none of the more specific reasons apply.
-	MachineDeletingDeletionTimestampSetV1Beta2Reason = DeletionTimestampSetV1Beta2Reason
+	MachineDeletingV1Beta2Reason = DeletingV1Beta2Reason
 
 	// MachineDeletingInternalErrorV1Beta2Reason surfaces unexpected failures when deleting a Machine.
 	MachineDeletingInternalErrorV1Beta2Reason = InternalErrorV1Beta2Reason
@@ -335,24 +368,24 @@ const (
 
 // MachineSpec defines the desired state of Machine.
 type MachineSpec struct {
-	// ClusterName is the name of the Cluster this object belongs to.
+	// clusterName is the name of the Cluster this object belongs to.
 	// +kubebuilder:validation:MinLength=1
 	ClusterName string `json:"clusterName"`
 
-	// Bootstrap is a reference to a local struct which encapsulates
+	// bootstrap is a reference to a local struct which encapsulates
 	// fields to configure the Machine’s bootstrapping mechanism.
 	Bootstrap Bootstrap `json:"bootstrap"`
 
-	// InfrastructureRef is a required reference to a custom resource
+	// infrastructureRef is a required reference to a custom resource
 	// offered by an infrastructure provider.
 	InfrastructureRef corev1.ObjectReference `json:"infrastructureRef"`
 
-	// Version defines the desired Kubernetes version.
+	// version defines the desired Kubernetes version.
 	// This field is meant to be optionally used by bootstrap providers.
 	// +optional
 	Version *string `json:"version,omitempty"`
 
-	// ProviderID is the identification ID of the machine provided by the provider.
+	// providerID is the identification ID of the machine provided by the provider.
 	// This field must match the provider ID as seen on the node object corresponding to this machine.
 	// This field is required by higher level consumers of cluster-api. Example use case is cluster autoscaler
 	// with cluster-api as provider. Clean-up logic in the autoscaler compares machines to nodes to find out
@@ -365,7 +398,7 @@ type MachineSpec struct {
 	// +optional
 	ProviderID *string `json:"providerID,omitempty"`
 
-	// FailureDomain is the failure domain the machine will be created in.
+	// failureDomain is the failure domain the machine will be created in.
 	// Must match a key in the FailureDomains map stored on the cluster object.
 	// +optional
 	FailureDomain *string `json:"failureDomain,omitempty"`
@@ -394,18 +427,18 @@ type MachineSpec struct {
 	// +kubebuilder:validation:MaxItems=32
 	ReadinessGates []MachineReadinessGate `json:"readinessGates,omitempty"`
 
-	// NodeDrainTimeout is the total amount of time that the controller will spend on draining a node.
+	// nodeDrainTimeout is the total amount of time that the controller will spend on draining a node.
 	// The default value is 0, meaning that the node can be drained without any time limitations.
 	// NOTE: NodeDrainTimeout is different from `kubectl drain --timeout`
 	// +optional
 	NodeDrainTimeout *metav1.Duration `json:"nodeDrainTimeout,omitempty"`
 
-	// NodeVolumeDetachTimeout is the total amount of time that the controller will spend on waiting for all volumes
+	// nodeVolumeDetachTimeout is the total amount of time that the controller will spend on waiting for all volumes
 	// to be detached. The default value is 0, meaning that the volumes can be detached without any time limitations.
 	// +optional
 	NodeVolumeDetachTimeout *metav1.Duration `json:"nodeVolumeDetachTimeout,omitempty"`
 
-	// NodeDeletionTimeout defines how long the controller will attempt to delete the Node that the Machine
+	// nodeDeletionTimeout defines how long the controller will attempt to delete the Node that the Machine
 	// hosts after the Machine is marked for deletion. A duration of 0 will retry deletion indefinitely.
 	// Defaults to 10 seconds.
 	// +optional
@@ -430,20 +463,20 @@ type MachineReadinessGate struct {
 
 // MachineStatus defines the observed state of Machine.
 type MachineStatus struct {
-	// NodeRef will point to the corresponding Node if it exists.
+	// nodeRef will point to the corresponding Node if it exists.
 	// +optional
 	NodeRef *corev1.ObjectReference `json:"nodeRef,omitempty"`
 
-	// NodeInfo is a set of ids/uuids to uniquely identify the node.
+	// nodeInfo is a set of ids/uuids to uniquely identify the node.
 	// More info: https://kubernetes.io/docs/concepts/nodes/node/#info
 	// +optional
 	NodeInfo *corev1.NodeSystemInfo `json:"nodeInfo,omitempty"`
 
-	// LastUpdated identifies when the phase of the Machine last transitioned.
+	// lastUpdated identifies when the phase of the Machine last transitioned.
 	// +optional
 	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
 
-	// FailureReason will be set in the event that there is a terminal problem
+	// failureReason will be set in the event that there is a terminal problem
 	// reconciling the Machine and will contain a succinct value suitable
 	// for machine interpretation.
 	//
@@ -465,7 +498,7 @@ type MachineStatus struct {
 	// +optional
 	FailureReason *capierrors.MachineStatusError `json:"failureReason,omitempty"`
 
-	// FailureMessage will be set in the event that there is a terminal problem
+	// failureMessage will be set in the event that there is a terminal problem
 	// reconciling the Machine and will contain a more verbose string suitable
 	// for logging and human consumption.
 	//
@@ -487,34 +520,34 @@ type MachineStatus struct {
 	// +optional
 	FailureMessage *string `json:"failureMessage,omitempty"`
 
-	// Addresses is a list of addresses assigned to the machine.
+	// addresses is a list of addresses assigned to the machine.
 	// This field is copied from the infrastructure provider reference.
 	// +optional
 	Addresses MachineAddresses `json:"addresses,omitempty"`
 
-	// Phase represents the current phase of machine actuation.
+	// phase represents the current phase of machine actuation.
 	// E.g. Pending, Running, Terminating, Failed etc.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// CertificatesExpiryDate is the expiry date of the machine certificates.
+	// certificatesExpiryDate is the expiry date of the machine certificates.
 	// This value is only set for control plane machines.
 	// +optional
 	CertificatesExpiryDate *metav1.Time `json:"certificatesExpiryDate,omitempty"`
 
-	// BootstrapReady is the state of the bootstrap provider.
+	// bootstrapReady is the state of the bootstrap provider.
 	// +optional
 	BootstrapReady bool `json:"bootstrapReady"`
 
-	// InfrastructureReady is the state of the infrastructure provider.
+	// infrastructureReady is the state of the infrastructure provider.
 	// +optional
 	InfrastructureReady bool `json:"infrastructureReady"`
 
-	// ObservedGeneration is the latest generation observed by the controller.
+	// observedGeneration is the latest generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Conditions defines current service state of the Machine.
+	// conditions defines current service state of the Machine.
 	// +optional
 	Conditions Conditions `json:"conditions,omitempty"`
 
@@ -590,14 +623,14 @@ func (m *MachineStatus) GetTypedPhase() MachinePhase {
 
 // Bootstrap encapsulates fields to configure the Machine’s bootstrapping mechanism.
 type Bootstrap struct {
-	// ConfigRef is a reference to a bootstrap provider-specific resource
+	// configRef is a reference to a bootstrap provider-specific resource
 	// that holds configuration details. The reference is optional to
 	// allow users/operators to specify Bootstrap.DataSecretName without
 	// the need of a controller.
 	// +optional
 	ConfigRef *corev1.ObjectReference `json:"configRef,omitempty"`
 
-	// DataSecretName is the name of the secret that stores the bootstrap data script.
+	// dataSecretName is the name of the secret that stores the bootstrap data script.
 	// If nil, the Machine should remain in the Pending state.
 	// +optional
 	DataSecretName *string `json:"dataSecretName,omitempty"`
@@ -645,7 +678,7 @@ func (m *Machine) GetV1Beta2Conditions() []metav1.Condition {
 
 // SetV1Beta2Conditions sets conditions for an API object.
 func (m *Machine) SetV1Beta2Conditions(conditions []metav1.Condition) {
-	if m.Status.V1Beta2 == nil && conditions != nil {
+	if m.Status.V1Beta2 == nil {
 		m.Status.V1Beta2 = &MachineV1Beta2Status{}
 	}
 	m.Status.V1Beta2.Conditions = conditions
