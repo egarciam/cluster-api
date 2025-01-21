@@ -191,6 +191,32 @@ func Test_setAvailableCondition(t *testing.T) {
 				Message: "3 available replicas, at least 4 required (spec.strategy.rollout.maxUnavailable is 1, spec.replicas is 5)",
 			},
 		},
+		{
+			name: "When deleting, don't show required replicas",
+			machineDeployment: &clusterv1.MachineDeployment{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: ptr.To(metav1.Now()),
+				},
+				Spec: clusterv1.MachineDeploymentSpec{
+					Replicas: ptr.To(int32(5)),
+					Strategy: &clusterv1.MachineDeploymentStrategy{
+						Type: clusterv1.RollingUpdateMachineDeploymentStrategyType,
+						RollingUpdate: &clusterv1.MachineRollingUpdateDeployment{
+							MaxSurge:       ptr.To(intstr.FromInt32(1)),
+							MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+						},
+					},
+				},
+				Status: clusterv1.MachineDeploymentStatus{V1Beta2: &clusterv1.MachineDeploymentV1Beta2Status{AvailableReplicas: ptr.To(int32(0))}},
+			},
+			getAndAdoptMachineSetsForDeploymentSucceeded: true,
+			expectCondition: metav1.Condition{
+				Type:    clusterv1.MachineDeploymentAvailableV1Beta2Condition,
+				Status:  metav1.ConditionFalse,
+				Reason:  clusterv1.MachineDeploymentNotAvailableV1Beta2Reason,
+				Message: "Deletion in progress",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -266,17 +292,18 @@ func Test_setRollingOutCondition(t *testing.T) {
 					Status: metav1.ConditionUnknown,
 					Reason: clusterv1.InternalErrorV1Beta2Reason,
 				})),
+				fakeMachine("machine-4", withV1Beta2Condition(metav1.Condition{
+					Type:   clusterv1.MachineUpToDateV1Beta2Condition,
+					Status: metav1.ConditionFalse,
+					Reason: clusterv1.MachineNotUpToDateV1Beta2Reason,
+					Message: "* Failure domain failure-domain1, failure-domain2 required\n" +
+						"* InfrastructureMachine is not up-to-date",
+				})),
 				fakeMachine("machine-3", withV1Beta2Condition(metav1.Condition{
 					Type:    clusterv1.MachineUpToDateV1Beta2Condition,
 					Status:  metav1.ConditionFalse,
 					Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-					Message: "Version v1.25.0, v1.26.0 required",
-				})),
-				fakeMachine("machine-4", withV1Beta2Condition(metav1.Condition{
-					Type:    clusterv1.MachineUpToDateV1Beta2Condition,
-					Status:  metav1.ConditionFalse,
-					Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-					Message: "Failure domain failure-domain1, failure-domain2 required; InfrastructureMachine is not up-to-date",
+					Message: "* Version v1.25.0, v1.26.0 required",
 				})),
 			},
 			getMachinesSucceeded: true,

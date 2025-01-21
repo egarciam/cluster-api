@@ -161,28 +161,34 @@ func (r *KubeadmControlPlaneReconciler) reconcileExternalReference(ctx context.C
 
 	// Note: We intentionally do not handle checking for the paused label on an external template reference
 
+	desiredOwnerRef := metav1.OwnerReference{
+		APIVersion: clusterv1.GroupVersion.String(),
+		Kind:       "Cluster",
+		Name:       controlPlane.Cluster.Name,
+		UID:        controlPlane.Cluster.UID,
+	}
+
+	if util.HasExactOwnerRef(obj.GetOwnerReferences(), desiredOwnerRef) {
+		return nil
+	}
+
 	patchHelper, err := patch.NewHelper(obj, r.Client)
 	if err != nil {
 		return err
 	}
 
-	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), metav1.OwnerReference{
-		APIVersion: clusterv1.GroupVersion.String(),
-		Kind:       "Cluster",
-		Name:       controlPlane.Cluster.Name,
-		UID:        controlPlane.Cluster.UID,
-	}))
+	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), desiredOwnerRef))
 
 	return patchHelper.Patch(ctx, obj)
 }
 
-func (r *KubeadmControlPlaneReconciler) cloneConfigsAndGenerateMachine(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, bootstrapSpec *bootstrapv1.KubeadmConfigSpec, failureDomain *string) error {
+func (r *KubeadmControlPlaneReconciler) cloneConfigsAndGenerateMachine(ctx context.Context, cluster *clusterv1.Cluster, kcp *controlplanev1.KubeadmControlPlane, bootstrapSpec *bootstrapv1.KubeadmConfigSpec, failureDomain *string) (*clusterv1.Machine, error) {
 	var errs []error
 
 	// Compute desired Machine
 	machine, err := r.computeDesiredMachine(kcp, cluster, failureDomain, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to create Machine: failed to compute desired Machine")
+		return nil, errors.Wrap(err, "failed to create Machine: failed to compute desired Machine")
 	}
 
 	// Since the cloned resource should eventually have a controller ref for the Machine, we create an
@@ -214,7 +220,7 @@ func (r *KubeadmControlPlaneReconciler) cloneConfigsAndGenerateMachine(ctx conte
 		// Safe to return early here since no resources have been created yet.
 		conditions.MarkFalse(kcp, controlplanev1.MachinesCreatedCondition, controlplanev1.InfrastructureTemplateCloningFailedReason,
 			clusterv1.ConditionSeverityError, err.Error())
-		return errors.Wrap(err, "failed to clone infrastructure template")
+		return nil, errors.Wrap(err, "failed to clone infrastructure template")
 	}
 	machine.Spec.InfrastructureRef = *infraRef
 
@@ -242,11 +248,10 @@ func (r *KubeadmControlPlaneReconciler) cloneConfigsAndGenerateMachine(ctx conte
 		if err := r.cleanupFromGeneration(ctx, infraRef, bootstrapRef); err != nil {
 			errs = append(errs, errors.Wrap(err, "failed to cleanup generated resources"))
 		}
-
-		return kerrors.NewAggregate(errs)
+		return nil, kerrors.NewAggregate(errs)
 	}
 
-	return nil
+	return machine, nil
 }
 
 func (r *KubeadmControlPlaneReconciler) cleanupFromGeneration(ctx context.Context, remoteRefs ...*corev1.ObjectReference) error {

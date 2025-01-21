@@ -226,7 +226,7 @@ func setRollingOutCondition(_ context.Context, kcp *controlplanev1.KubeadmContro
 		}
 		rollingOutReplicas++
 		if upToDateCondition.Message != "" {
-			rolloutReasons.Insert(strings.Split(upToDateCondition.Message, "; ")...)
+			rolloutReasons.Insert(strings.Split(upToDateCondition.Message, "\n")...)
 		}
 	}
 
@@ -247,17 +247,14 @@ func setRollingOutCondition(_ context.Context, kcp *controlplanev1.KubeadmContro
 		// Surface rollout reasons ensuring that if there is a version change, it goes first.
 		reasons := rolloutReasons.UnsortedList()
 		sort.Slice(reasons, func(i, j int) bool {
-			if strings.HasPrefix(reasons[i], "Version") && !strings.HasPrefix(reasons[j], "Version") {
+			if strings.HasPrefix(reasons[i], "* Version") && !strings.HasPrefix(reasons[j], "* Version") {
 				return true
 			}
-			if !strings.HasPrefix(reasons[i], "Version") && strings.HasPrefix(reasons[j], "Version") {
+			if !strings.HasPrefix(reasons[i], "* Version") && strings.HasPrefix(reasons[j], "* Version") {
 				return false
 			}
 			return reasons[i] < reasons[j]
 		})
-		for i := range reasons {
-			reasons[i] = fmt.Sprintf("* %s", reasons[i])
-		}
 		message += fmt.Sprintf("\n%s", strings.Join(reasons, "\n"))
 	}
 	v1beta2conditions.Set(kcp, metav1.Condition{
@@ -590,6 +587,14 @@ func setAvailableCondition(_ context.Context, kcp *controlplanev1.KubeadmControl
 	k8sControlPlaneNotHealthyButNotReportedYet := 0
 
 	for _, machine := range machines {
+		// Ignore machines without a provider ID yet (which also implies infrastructure not ready).
+		// Note: this avoids some noise when a new machine is provisioning; it is not possible to delay further
+		// because the etcd member might join the cluster / control plane components might start even before
+		// kubelet registers the node to the API server (e.g. in case kubelet has issues to register itself).
+		if machine.Spec.ProviderID == nil {
+			continue
+		}
+
 		// if external etcd, only look at the status of the K8s control plane components on this machine.
 		if !etcdIsManaged {
 			if v1beta2conditions.IsTrue(machine, controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyV1Beta2Condition) &&

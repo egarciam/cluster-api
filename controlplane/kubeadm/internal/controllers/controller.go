@@ -115,7 +115,7 @@ func (r *KubeadmControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "kubeadmcontrolplane")
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&controlplanev1.KubeadmControlPlane{}).
-		Owns(&clusterv1.Machine{}).
+		Owns(&clusterv1.Machine{}, builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog))).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Watches(
@@ -123,6 +123,7 @@ func (r *KubeadmControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 			handler.EnqueueRequestsFromMapFunc(r.ClusterToKubeadmControlPlane),
 			builder.WithPredicates(
 				predicates.All(mgr.GetScheme(), predicateLog,
+					predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog),
 					predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
 					predicates.ClusterPausedTransitionsOrInfrastructureReady(mgr.GetScheme(), predicateLog),
 				),
@@ -137,7 +138,7 @@ func (r *KubeadmControlPlaneReconciler) SetupWithManager(ctx context.Context, mg
 
 	r.controller = c
 	r.recorder = mgr.GetEventRecorderFor("kubeadmcontrolplane-controller")
-	r.ssaCache = ssa.NewCache()
+	r.ssaCache = ssa.NewCache("kubeadmcontrolplane")
 
 	if r.managementCluster == nil {
 		r.managementCluster = &internal.Management{
@@ -671,10 +672,13 @@ func (r *KubeadmControlPlaneReconciler) reconcileDelete(ctx context.Context, con
 			continue
 		}
 
-		log.Info("Deleting control plane Machine")
 		if err := r.Client.Delete(ctx, machineToDelete); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, errors.Wrapf(err, "failed to delete control plane Machine %s", klog.KObj(machineToDelete)))
 		}
+		// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
+		// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
+		log.WithValues(controlPlane.StatusToLogKeyAndValues(nil, machineToDelete)...).
+			Info("Deleting Machine (KubeadmControlPlane deleted)")
 	}
 	if len(errs) > 0 {
 		err := kerrors.NewAggregate(errs)
@@ -977,9 +981,13 @@ func reconcileMachineUpToDateCondition(_ context.Context, controlPlane *internal
 
 	for _, machine := range controlPlane.Machines {
 		if machinesNotUptoDateNames.Has(machine.Name) {
+			// Note: the code computing the message for KCP's RolloutOut condition is making assumptions on the format/content of this message.
 			message := ""
 			if reasons, ok := machinesNotUptoDateConditionMessages[machine.Name]; ok {
-				message = strings.Join(reasons, "; ")
+				for i := range reasons {
+					reasons[i] = fmt.Sprintf("* %s", reasons[i])
+				}
+				message = strings.Join(reasons, "\n")
 			}
 
 			v1beta2conditions.Set(machine, metav1.Condition{
@@ -1095,7 +1103,25 @@ func (r *KubeadmControlPlaneReconciler) reconcileEtcdMembers(ctx context.Context
 		return nil
 	}
 
+	// No op if there are potential issues affecting the list of etcdMembers
+	if !controlPlane.EtcdMembersAgreeOnMemberList || !controlPlane.EtcdMembersAgreeOnClusterID {
+		return nil
+	}
+
+	// No op if for any reason the etcdMember list is not populated at this stage.
+	if controlPlane.EtcdMembers == nil {
+		return nil
+	}
+
+	// Potential inconsistencies between the list of members and the list of machines/nodes are
+	// surfaced using the EtcdClusterHealthyCondition; if this condition is true, meaning no inconsistencies exists, return early.
+	if conditions.IsTrue(controlPlane.KCP, controlplanev1.EtcdClusterHealthyCondition) {
+		return nil
+	}
+
 	// Collect all the node names.
+	// Note: EtcdClusterHealthyCondition true also implies that there are no machines still provisioning,
+	// so we can ignore this case.
 	nodeNames := []string{}
 	for _, machine := range controlPlane.Machines {
 		if machine.Status.NodeRef == nil {
@@ -1105,19 +1131,13 @@ func (r *KubeadmControlPlaneReconciler) reconcileEtcdMembers(ctx context.Context
 		nodeNames = append(nodeNames, machine.Status.NodeRef.Name)
 	}
 
-	// Potential inconsistencies between the list of members and the list of machines/nodes are
-	// surfaced using the EtcdClusterHealthyCondition; if this condition is true, meaning no inconsistencies exists, return early.
-	if conditions.IsTrue(controlPlane.KCP, controlplanev1.EtcdClusterHealthyCondition) {
-		return nil
-	}
-
 	workloadCluster, err := controlPlane.GetWorkloadCluster(ctx)
 	if err != nil {
 		// Failing at connecting to the workload cluster can mean workload cluster is unhealthy for a variety of reasons such as etcd quorum loss.
 		return errors.Wrap(err, "cannot get remote client to workload cluster")
 	}
 
-	removedMembers, err := workloadCluster.ReconcileEtcdMembers(ctx, nodeNames)
+	removedMembers, err := workloadCluster.ReconcileEtcdMembersAndControlPlaneNodes(ctx, controlPlane.EtcdMembers, nodeNames)
 	if err != nil {
 		return errors.Wrap(err, "failed attempt to reconcile etcd members")
 	}

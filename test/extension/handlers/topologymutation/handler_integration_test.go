@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/cluster-api/controllers"
 	runtimev1 "sigs.k8s.io/cluster-api/exp/runtime/api/v1alpha1"
 	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
+	runtimeclient "sigs.k8s.io/cluster-api/exp/runtime/client"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/exp/runtime/hooks/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/exp/topology/desiredstate"
 	"sigs.k8s.io/cluster-api/exp/topology/scope"
@@ -405,13 +406,15 @@ type TopologyMutationHook interface {
 	ValidateTopology(ctx context.Context, req *runtimehooksv1.ValidateTopologyRequest, resp *runtimehooksv1.ValidateTopologyResponse)
 }
 
+var _ runtimeclient.Client = &injectRuntimeClient{}
+
 // injectRuntimeClient implements a runtimeclient.Client.
 // It allows us to plug a TopologyMutationHook into Cluster and ClusterClass controllers.
 type injectRuntimeClient struct {
 	runtimeExtension TopologyMutationHook
 }
 
-func (i injectRuntimeClient) CallExtension(ctx context.Context, hook runtimecatalog.Hook, _ metav1.Object, _ string, req runtimehooksv1.RequestObject, resp runtimehooksv1.ResponseObject) error {
+func (i injectRuntimeClient) CallExtension(ctx context.Context, hook runtimecatalog.Hook, _ metav1.Object, _ string, req runtimehooksv1.RequestObject, resp runtimehooksv1.ResponseObject, _ ...runtimeclient.CallExtensionOption) error {
 	// Note: We have to copy the requests. Otherwise we could get side effect by Runtime Extensions
 	// modifying the request instead of properly returning a response. Also after Unmarshal,
 	// only the Raw fields in runtime.RawExtension fields should be filled out and Object should be nil.

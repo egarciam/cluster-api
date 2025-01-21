@@ -18,6 +18,9 @@ package internal
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,6 +35,7 @@ import (
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal/etcd"
 	"sigs.k8s.io/cluster-api/util/collections"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/failuredomains"
 	"sigs.k8s.io/cluster-api/util/patch"
 )
@@ -153,9 +157,10 @@ func (c *ControlPlane) FailureDomains() clusterv1.FailureDomains {
 }
 
 // MachineInFailureDomainWithMostMachines returns the first matching failure domain with machines that has the most control-plane machines on it.
-func (c *ControlPlane) MachineInFailureDomainWithMostMachines(ctx context.Context, machines collections.Machines) (*clusterv1.Machine, error) {
-	fd := c.FailureDomainWithMostMachines(ctx, machines)
-	machinesInFailureDomain := machines.Filter(collections.InFailureDomains(fd))
+// Note: if there are eligibleMachines machines in failure domain that do not exists anymore, getting rid of those machines take precedence.
+func (c *ControlPlane) MachineInFailureDomainWithMostMachines(ctx context.Context, eligibleMachines collections.Machines) (*clusterv1.Machine, error) {
+	fd := c.FailureDomainWithMostMachines(ctx, eligibleMachines)
+	machinesInFailureDomain := eligibleMachines.Filter(collections.InFailureDomains(fd))
 	machineToMark := machinesInFailureDomain.Oldest()
 	if machineToMark == nil {
 		return nil, errors.New("failed to pick control plane Machine to mark for deletion")
@@ -171,11 +176,11 @@ func (c *ControlPlane) MachineWithDeleteAnnotation(machines collections.Machines
 	return annotatedMachines
 }
 
-// FailureDomainWithMostMachines returns a fd which exists both in machines and control-plane machines and has the most
-// control-plane machines on it.
-func (c *ControlPlane) FailureDomainWithMostMachines(ctx context.Context, machines collections.Machines) *string {
+// FailureDomainWithMostMachines returns the fd with most machines in it and at least one eligible machine in it.
+// Note: if there are eligibleMachines machines in failure domain that do not exist anymore, cleaning up those failure domains takes precedence.
+func (c *ControlPlane) FailureDomainWithMostMachines(ctx context.Context, eligibleMachines collections.Machines) *string {
 	// See if there are any Machines that are not in currently defined failure domains first.
-	notInFailureDomains := machines.Filter(
+	notInFailureDomains := eligibleMachines.Filter(
 		collections.Not(collections.InFailureDomains(c.FailureDomains().FilterControlPlane().GetIDs()...)),
 	)
 	if len(notInFailureDomains) > 0 {
@@ -184,15 +189,21 @@ func (c *ControlPlane) FailureDomainWithMostMachines(ctx context.Context, machin
 		// in the cluster status.
 		return notInFailureDomains.Oldest().Spec.FailureDomain
 	}
-	return failuredomains.PickMost(ctx, c.Cluster.Status.FailureDomains.FilterControlPlane(), c.Machines, machines)
+
+	// Pick the failure domain with most machines in it and at least one eligible machine in it.
+	return failuredomains.PickMost(ctx, c.Cluster.Status.FailureDomains.FilterControlPlane(), c.Machines, eligibleMachines)
 }
 
-// NextFailureDomainForScaleUp returns the failure domain with the fewest number of up-to-date, not deleted machines.
+// NextFailureDomainForScaleUp returns the failure domain with the fewest number of up-to-date, not deleted machines
+// (the ultimate goal is to achieve ideal spreading of machines at stable state/when only up-to-date machines will exist).
+//
+// In case of tie (more failure domain with the same number of up-to-date, not deleted machines) the failure domain with the fewest number of
+// machine overall is picked to ensure a better spreading of machines while the rollout is performed.
 func (c *ControlPlane) NextFailureDomainForScaleUp(ctx context.Context) (*string, error) {
 	if len(c.Cluster.Status.FailureDomains.FilterControlPlane()) == 0 {
 		return nil, nil
 	}
-	return failuredomains.PickFewest(ctx, c.FailureDomains().FilterControlPlane(), c.UpToDateMachines().Filter(collections.Not(collections.HasDeletionTimestamp))), nil
+	return failuredomains.PickFewest(ctx, c.FailureDomains().FilterControlPlane(), c.Machines, c.UpToDateMachines().Filter(collections.Not(collections.HasDeletionTimestamp))), nil
 }
 
 // InitialControlPlaneConfig returns a new KubeadmConfigSpec that is to be used for an initializing control plane.
@@ -377,4 +388,82 @@ func (c *ControlPlane) GetWorkloadCluster(ctx context.Context) (WorkloadCluster,
 func (c *ControlPlane) InjectTestManagementCluster(managementCluster ManagementCluster) {
 	c.managementCluster = managementCluster
 	c.workloadCluster = nil
+}
+
+// StatusToLogKeyAndValues returns the following key/value pairs describing the overall status of the control plane:
+// - machines is the list of KCP machines; each machine might have additional notes surfacing
+//   - if the machine has been created in the current reconcile
+//   - if machines node ref is not yet set
+//   - if the machine has been marked for remediation
+//   - if there are unhealthy control plane component on the machine
+//   - if the machine has a deletion timestamp/has been deleted in the current reconcile
+//   - if the machine is not up to date with the KCP spec
+//
+// - etcdMembers list as reported by etcd.
+func (c *ControlPlane) StatusToLogKeyAndValues(newMachine, deletedMachine *clusterv1.Machine) []any {
+	controlPlaneMachineHealthConditions := []clusterv1.ConditionType{
+		controlplanev1.MachineAPIServerPodHealthyCondition,
+		controlplanev1.MachineControllerManagerPodHealthyCondition,
+		controlplanev1.MachineSchedulerPodHealthyCondition,
+	}
+	if c.IsEtcdManaged() {
+		controlPlaneMachineHealthConditions = append(controlPlaneMachineHealthConditions,
+			controlplanev1.MachineEtcdPodHealthyCondition,
+			controlplanev1.MachineEtcdMemberHealthyCondition,
+		)
+	}
+
+	machines := []string{}
+	for _, m := range c.Machines {
+		notes := []string{}
+
+		if m.Status.NodeRef == nil {
+			notes = append(notes, "status.nodeRef not set")
+		}
+
+		if c.MachinesToBeRemediatedByKCP().Has(m) {
+			notes = append(notes, "marked for remediation")
+		}
+
+		for _, condition := range controlPlaneMachineHealthConditions {
+			if conditions.IsUnknown(m, condition) {
+				notes = append(notes, strings.Replace(string(condition), "Healthy", " health unknown", -1))
+			}
+			if conditions.IsFalse(m, condition) {
+				notes = append(notes, strings.Replace(string(condition), "Healthy", " not healthy", -1))
+			}
+		}
+
+		if !c.UpToDateMachines().Has(m) {
+			notes = append(notes, "not up-to-date")
+		}
+
+		if deletedMachine != nil && m.Name == deletedMachine.Name {
+			notes = append(notes, "just deleted")
+		} else if !m.DeletionTimestamp.IsZero() {
+			notes = append(notes, "deleting")
+		}
+
+		name := m.Name
+		if len(notes) > 0 {
+			name = fmt.Sprintf("%s (%s)", name, strings.Join(notes, ", "))
+		}
+		machines = append(machines, name)
+	}
+
+	if newMachine != nil {
+		machines = append(machines, fmt.Sprintf("%s (just created)", newMachine.Name))
+	}
+	sort.Strings(machines)
+
+	etcdMembers := []string{}
+	for _, m := range c.EtcdMembers {
+		etcdMembers = append(etcdMembers, m.Name)
+	}
+	sort.Strings(etcdMembers)
+
+	return []any{
+		"machines", strings.Join(machines, ", "),
+		"etcdMembers", strings.Join(etcdMembers, ", "),
+	}
 }

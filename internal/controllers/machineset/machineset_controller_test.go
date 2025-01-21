@@ -17,7 +17,9 @@ limitations under the License.
 package machineset
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,11 +28,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -1283,7 +1287,7 @@ func TestMachineSetReconciler_syncMachines(t *testing.T) {
 	// for Machines, InfrastructureMachines and BootstrapConfigs.
 	reconciler := &Reconciler{
 		Client:   env,
-		ssaCache: ssa.NewCache(),
+		ssaCache: ssa.NewCache("test-controller"),
 	}
 	s := &scope{
 		machineSet: ms,
@@ -2346,6 +2350,157 @@ func TestMachineSetReconciler_syncReplicas(t *testing.T) {
 	})
 }
 
+func TestMachineSetReconciler_syncReplicas_WithErrors(t *testing.T) {
+	t.Run("should hold off on sync replicas when create Infrastructure of machine failed ", func(t *testing.T) {
+		g := NewWithT(t)
+		fakeClient := fake.NewClientBuilder().WithObjects().WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				// simulate scenarios where infra object creation fails
+				if obj.GetObjectKind().GroupVersionKind().Kind == "GenericInfrastructureMachine" {
+					return fmt.Errorf("inject error for create machineInfrastructure")
+				}
+				return client.Create(ctx, obj, opts...)
+			},
+		}).Build()
+
+		r := &Reconciler{
+			Client: fakeClient,
+		}
+		testCluster := &clusterv1.Cluster{}
+		testCluster.Namespace = "default"
+		testCluster.Name = "test-cluster"
+		version := "v1.14.2"
+		duration10m := &metav1.Duration{Duration: 10 * time.Minute}
+		machineSet := &clusterv1.MachineSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "machineset1",
+				Namespace:  metav1.NamespaceDefault,
+				Finalizers: []string{"block-deletion"},
+			},
+			Spec: clusterv1.MachineSetSpec{
+				Replicas:    ptr.To[int32](1),
+				ClusterName: "test-cluster",
+				Template: clusterv1.MachineTemplateSpec{
+					Spec: clusterv1.MachineSpec{
+						ClusterName: testCluster.Name,
+						Version:     &version,
+						Bootstrap: clusterv1.Bootstrap{
+							ConfigRef: &corev1.ObjectReference{
+								APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
+								Kind:       "GenericBootstrapConfigTemplate",
+								Name:       "ms-template",
+								Namespace:  metav1.NamespaceDefault,
+							},
+						},
+						InfrastructureRef: corev1.ObjectReference{
+							APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
+							Kind:       "GenericInfrastructureMachineTemplate",
+							Name:       "ms-template",
+							Namespace:  metav1.NamespaceDefault,
+						},
+						NodeDrainTimeout:        duration10m,
+						NodeDeletionTimeout:     duration10m,
+						NodeVolumeDetachTimeout: duration10m,
+					},
+				},
+			},
+		}
+
+		// Create bootstrap template resource.
+		bootstrapResource := map[string]interface{}{
+			"kind":       "GenericBootstrapConfig",
+			"apiVersion": "bootstrap.cluster.x-k8s.io/v1beta1",
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"precedence": "GenericBootstrapConfig",
+				},
+			},
+		}
+		bootstrapTmpl := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"spec": map[string]interface{}{
+					"template": bootstrapResource,
+				},
+			},
+		}
+		bootstrapTmpl.SetKind("GenericBootstrapConfigTemplate")
+		bootstrapTmpl.SetAPIVersion("bootstrap.cluster.x-k8s.io/v1beta1")
+		bootstrapTmpl.SetName("ms-template")
+		bootstrapTmpl.SetNamespace(metav1.NamespaceDefault)
+		g.Expect(r.Client.Create(context.TODO(), bootstrapTmpl)).To(Succeed())
+
+		// Create infrastructure template resource.
+		infraResource := map[string]interface{}{
+			"kind":       "GenericInfrastructureMachine",
+			"apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"precedence": "GenericInfrastructureMachineTemplate",
+				},
+			},
+			"spec": map[string]interface{}{
+				"size": "3xlarge",
+			},
+		}
+		infraTmpl := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"spec": map[string]interface{}{
+					"template": infraResource,
+				},
+			},
+		}
+		infraTmpl.SetKind("GenericInfrastructureMachineTemplate")
+		infraTmpl.SetAPIVersion("infrastructure.cluster.x-k8s.io/v1beta1")
+		infraTmpl.SetName("ms-template")
+		infraTmpl.SetNamespace(metav1.NamespaceDefault)
+		g.Expect(r.Client.Create(context.TODO(), infraTmpl)).To(Succeed())
+
+		s := &scope{
+			cluster:    testCluster,
+			machineSet: machineSet,
+			machines:   []*clusterv1.Machine{},
+			getAndAdoptMachinesForMachineSetSucceeded: true,
+		}
+		_, err := r.syncReplicas(ctx, s)
+		g.Expect(err).To(HaveOccurred())
+
+		// Verify the proper condition is set on the MachineSet.
+		condition := clusterv1.MachinesCreatedCondition
+		g.Expect(conditions.Has(machineSet, condition)).To(BeTrue(), "MachineSet should have the %s condition set", condition)
+
+		machinesCreatedCondition := conditions.Get(machineSet, condition)
+		g.Expect(machinesCreatedCondition.Status).
+			To(Equal(corev1.ConditionFalse), "%s condition status should be %s", condition, corev1.ConditionFalse)
+		g.Expect(machinesCreatedCondition.Reason).
+			To(Equal(clusterv1.InfrastructureTemplateCloningFailedReason), "%s condition reason should be %s", condition, clusterv1.InfrastructureTemplateCloningFailedReason)
+
+		// Verify no new Machines are created.
+		machineList := &clusterv1.MachineList{}
+		g.Expect(r.Client.List(ctx, machineList)).To(Succeed())
+		g.Expect(machineList.Items).To(BeEmpty(), "There should not be any machines")
+
+		// Verify no boostrap object created
+		bootstrapList := &unstructured.UnstructuredList{}
+		bootstrapList.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   bootstrapTmpl.GetObjectKind().GroupVersionKind().Group,
+			Version: bootstrapTmpl.GetObjectKind().GroupVersionKind().Version,
+			Kind:    strings.TrimSuffix(bootstrapTmpl.GetObjectKind().GroupVersionKind().Kind, clusterv1.TemplateSuffix),
+		})
+		g.Expect(r.Client.List(ctx, bootstrapList)).To(Succeed())
+		g.Expect(bootstrapList.Items).To(BeEmpty(), "There should not be any bootstrap object")
+
+		// Verify no infra object created
+		infraList := &unstructured.UnstructuredList{}
+		infraList.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   infraTmpl.GetObjectKind().GroupVersionKind().Group,
+			Version: infraTmpl.GetObjectKind().GroupVersionKind().Version,
+			Kind:    strings.TrimSuffix(infraTmpl.GetObjectKind().GroupVersionKind().Kind, clusterv1.TemplateSuffix),
+		})
+		g.Expect(r.Client.List(ctx, infraList)).To(Succeed())
+		g.Expect(infraList.Items).To(BeEmpty(), "There should not be any infra object")
+	})
+}
+
 func TestComputeDesiredMachine(t *testing.T) {
 	duration5s := &metav1.Duration{Duration: 5 * time.Second}
 	duration10s := &metav1.Duration{Duration: 10 * time.Second}
@@ -2659,7 +2814,7 @@ func TestNewMachineUpToDateCondition(t *testing.T) {
 				Type:    clusterv1.MachineUpToDateV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-				Message: "Version v1.30.0, v1.31.0 required",
+				Message: "* Version v1.30.0, v1.31.0 required",
 			},
 		},
 		{
@@ -2720,7 +2875,7 @@ func TestNewMachineUpToDateCondition(t *testing.T) {
 				Type:    clusterv1.MachineUpToDateV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-				Message: "MachineDeployment spec.rolloutAfter expired",
+				Message: "* MachineDeployment spec.rolloutAfter expired",
 			},
 		},
 		{
@@ -2751,6 +2906,38 @@ func TestNewMachineUpToDateCondition(t *testing.T) {
 				Type:   clusterv1.MachineUpToDateV1Beta2Condition,
 				Status: metav1.ConditionTrue,
 				Reason: clusterv1.MachineUpToDateV1Beta2Reason,
+			},
+		},
+		{
+			name: "not up-to-date, version changed, rollout After expired",
+			machineDeployment: &clusterv1.MachineDeployment{
+				Spec: clusterv1.MachineDeploymentSpec{
+					RolloutAfter: &metav1.Time{Time: reconciliationTime.Add(-1 * time.Hour)}, // rollout after expired
+					Template: clusterv1.MachineTemplateSpec{
+						Spec: clusterv1.MachineSpec{
+							Version: ptr.To("v1.30.0"),
+						},
+					},
+				},
+			},
+			machineSet: &clusterv1.MachineSet{
+				ObjectMeta: metav1.ObjectMeta{
+					CreationTimestamp: metav1.Time{Time: reconciliationTime.Add(-2 * time.Hour)}, // MS created before rollout after
+				},
+				Spec: clusterv1.MachineSetSpec{
+					Template: clusterv1.MachineTemplateSpec{
+						Spec: clusterv1.MachineSpec{
+							Version: ptr.To("v1.31.0"),
+						},
+					},
+				},
+			},
+			expectCondition: &metav1.Condition{
+				Type:   clusterv1.MachineUpToDateV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: clusterv1.MachineNotUpToDateV1Beta2Reason,
+				Message: "* Version v1.31.0, v1.30.0 required\n" +
+					"* MachineDeployment spec.rolloutAfter expired",
 			},
 		},
 	}

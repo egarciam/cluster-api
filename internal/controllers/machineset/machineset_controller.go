@@ -121,15 +121,17 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 
 	err = ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.MachineSet{}).
-		Owns(&clusterv1.Machine{}).
+		Owns(&clusterv1.Machine{}, builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog))).
 		// Watches enqueues MachineSet for corresponding Machine resources, if no managed controller reference (owner) exists.
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.MachineToMachineSets),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		Watches(
 			&clusterv1.MachineDeployment{},
 			handler.EnqueueRequestsFromMapFunc(mdToMachineSets),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
@@ -139,6 +141,7 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 			builder.WithPredicates(
 				// TODO: should this wait for Cluster.Status.InfrastructureReady similar to Infra Machine resources?
 				predicates.All(mgr.GetScheme(), predicateLog,
+					predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog),
 					predicates.ClusterPausedTransitions(mgr.GetScheme(), predicateLog),
 					predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
 				),
@@ -151,7 +154,7 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 	}
 
 	r.recorder = mgr.GetEventRecorderFor("machineset-controller")
-	r.ssaCache = ssa.NewCache()
+	r.ssaCache = ssa.NewCache("machineset")
 	return nil
 }
 
@@ -424,10 +427,12 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	// else delete owned machines.
 	for _, machine := range machineList {
 		if machine.DeletionTimestamp.IsZero() {
-			log.Info("Deleting Machine", "Machine", klog.KObj(machine))
 			if err := r.Client.Delete(ctx, machine); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, errors.Wrapf(err, "failed to delete Machine %s", klog.KObj(machine))
 			}
+			// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
+			// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
+			log.Info("Deleting Machine (MachineSet deleted)", "Machine", klog.KObj(machine))
 		}
 	}
 
@@ -641,11 +646,15 @@ func newMachineUpToDateCondition(s *scope) *metav1.Condition {
 	}
 
 	if !upToDate {
+		for i := range conditionMessages {
+			conditionMessages[i] = fmt.Sprintf("* %s", conditionMessages[i])
+		}
 		return &metav1.Condition{
-			Type:    clusterv1.MachineUpToDateV1Beta2Condition,
-			Status:  metav1.ConditionFalse,
-			Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-			Message: strings.Join(conditionMessages, "; "),
+			Type:   clusterv1.MachineUpToDateV1Beta2Condition,
+			Status: metav1.ConditionFalse,
+			Reason: clusterv1.MachineNotUpToDateV1Beta2Reason,
+			// Note: the code computing the message for MachineDeployment's RolloutOut condition is making assumptions on the format/content of this message.
+			Message: strings.Join(conditionMessages, "\n"),
 		}
 	}
 
@@ -759,10 +768,17 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 				},
 			})
 			if err != nil {
+				var deleteErr error
+				if bootstrapRef != nil {
+					// Cleanup the bootstrap resource if we can't create the InfraMachine; or we might risk to leak it.
+					if err := r.Client.Delete(ctx, util.ObjectReferenceToUnstructured(*bootstrapRef)); err != nil && !apierrors.IsNotFound(err) {
+						deleteErr = errors.Wrapf(err, "failed to cleanup %s %s after %s creation failed", bootstrapRef.Kind, klog.KRef(bootstrapRef.Namespace, bootstrapRef.Name), (&ms.Spec.Template.Spec.InfrastructureRef).Kind)
+					}
+				}
 				conditions.MarkFalse(ms, clusterv1.MachinesCreatedCondition, clusterv1.InfrastructureTemplateCloningFailedReason, clusterv1.ConditionSeverityError, err.Error())
-				return ctrl.Result{}, errors.Wrapf(err, "failed to clone infrastructure machine from %s %s while creating a machine",
+				return ctrl.Result{}, kerrors.NewAggregate([]error{errors.Wrapf(err, "failed to clone infrastructure machine from %s %s while creating a machine",
 					ms.Spec.Template.Spec.InfrastructureRef.Kind,
-					klog.KRef(ms.Spec.Template.Spec.InfrastructureRef.Namespace, ms.Spec.Template.Spec.InfrastructureRef.Name))
+					klog.KRef(ms.Spec.Template.Spec.InfrastructureRef.Namespace, ms.Spec.Template.Spec.InfrastructureRef.Name)), deleteErr})
 			}
 			log = log.WithValues(infraRef.Kind, klog.KRef(infraRef.Namespace, infraRef.Name))
 			machine.Spec.InfrastructureRef = *infraRef
@@ -787,7 +803,7 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 				continue
 			}
 
-			log.Info(fmt.Sprintf("Created machine %d of %d", i+1, diff), "Machine", klog.KObj(machine))
+			log.Info(fmt.Sprintf("Machine created (scale up, creating %d of %d)", i+1, diff), "Machine", klog.KObj(machine))
 			r.recorder.Eventf(ms, corev1.EventTypeNormal, "SuccessfulCreate", "Created machine %q", machine.Name)
 			machineList = append(machineList, machine)
 		}
@@ -809,16 +825,18 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 		for i, machine := range machinesToDelete {
 			log := log.WithValues("Machine", klog.KObj(machine))
 			if machine.GetDeletionTimestamp().IsZero() {
-				log.Info(fmt.Sprintf("Deleting machine %d of %d", i+1, diff))
 				if err := r.Client.Delete(ctx, machine); err != nil {
 					log.Error(err, "Unable to delete Machine")
 					r.recorder.Eventf(ms, corev1.EventTypeWarning, "FailedDelete", "Failed to delete machine %q: %v", machine.Name, err)
 					errs = append(errs, err)
 					continue
 				}
+				// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
+				// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
+				log.Info(fmt.Sprintf("Deleting Machine (scale down, deleting %d of %d)", i+1, diff))
 				r.recorder.Eventf(ms, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted machine %q", machine.Name)
 			} else {
-				log.Info(fmt.Sprintf("Waiting for machine %d of %d to be deleted", i+1, diff))
+				log.Info(fmt.Sprintf("Waiting for Machine to be deleted (scale down, deleting %d of %d)", i+1, diff))
 			}
 		}
 
@@ -1485,10 +1503,12 @@ func (r *Reconciler) reconcileUnhealthyMachines(ctx context.Context, s *scope) (
 	}
 	var errs []error
 	for _, m := range machinesToRemediate {
-		log.Info("Deleting unhealthy Machine", "Machine", klog.KObj(m))
 		if err := r.Client.Delete(ctx, m); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, errors.Wrapf(err, "failed to delete Machine %s", klog.KObj(m)))
 		}
+		// Note: We intentionally log after Delete because we want this log line to show up only after DeletionTimestamp has been set.
+		// Also, setting DeletionTimestamp doesn't mean the Machine is actually deleted (deletion takes some time).
+		log.Info("Deleting Machine (remediating unhealthy Machine)", "Machine", klog.KObj(m))
 	}
 	if len(errs) > 0 {
 		return ctrl.Result{}, errors.Wrapf(kerrors.NewAggregate(errs), "failed to delete unhealthy Machines")
@@ -1564,17 +1584,23 @@ func (r *Reconciler) reconcileExternalTemplateReference(ctx context.Context, clu
 		return false, err
 	}
 
+	desiredOwnerRef := metav1.OwnerReference{
+		APIVersion: clusterv1.GroupVersion.String(),
+		Kind:       "Cluster",
+		Name:       cluster.Name,
+		UID:        cluster.UID,
+	}
+
+	if util.HasExactOwnerRef(obj.GetOwnerReferences(), desiredOwnerRef) {
+		return false, nil
+	}
+
 	patchHelper, err := patch.NewHelper(obj, r.Client)
 	if err != nil {
 		return false, err
 	}
 
-	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), metav1.OwnerReference{
-		APIVersion: clusterv1.GroupVersion.String(),
-		Kind:       "Cluster",
-		Name:       cluster.Name,
-		UID:        cluster.UID,
-	}))
+	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), desiredOwnerRef))
 
 	return false, patchHelper.Patch(ctx, obj)
 }

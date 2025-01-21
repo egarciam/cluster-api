@@ -558,12 +558,9 @@ func TestSummarizeNodeV1Beta2Conditions(t *testing.T) {
 				{Type: corev1.NodeDiskPressure, Status: corev1.ConditionUnknown, Message: "Node is not reporting status"},
 				{Type: corev1.NodePIDPressure, Status: corev1.ConditionUnknown, Message: "Node is not reporting status"},
 			},
-			expectedStatus: metav1.ConditionUnknown,
-			expectedReason: clusterv1.MachineNodeHealthUnknownV1Beta2Reason,
-			expectedMessage: "* Node.Ready: Node is not reporting status\n" +
-				"* Node.MemoryPressure: Node is not reporting status\n" +
-				"* Node.DiskPressure: Node is not reporting status\n" +
-				"* Node.PIDPressure: Node is not reporting status",
+			expectedStatus:  metav1.ConditionUnknown,
+			expectedReason:  clusterv1.MachineNodeHealthUnknownV1Beta2Reason,
+			expectedMessage: "* Node.AllConditions: Node is not reporting status",
 		},
 		{
 			name: "multiple semantically failed condition",
@@ -1131,12 +1128,12 @@ func TestDeletingCondition(t *testing.T) {
 			},
 			reconcileDeleteExecuted: true,
 			deletingReason:          clusterv1.MachineDeletingWaitingForPreDrainHookV1Beta2Reason,
-			deletingMessage:         "Waiting for pre-drain hooks to complete (hooks: test-hook)",
+			deletingMessage:         "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 			expectCondition: metav1.Condition{
 				Type:    clusterv1.MachineDeletingV1Beta2Condition,
 				Status:  metav1.ConditionTrue,
 				Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookV1Beta2Reason,
-				Message: "Waiting for pre-drain hooks to complete (hooks: test-hook)",
+				Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 			},
 		},
 		{
@@ -1189,7 +1186,7 @@ func TestDeletingCondition(t *testing.T) {
 								Type:    clusterv1.MachineDeletingV1Beta2Condition,
 								Status:  metav1.ConditionTrue,
 								Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookV1Beta2Reason,
-								Message: "Waiting for pre-drain hooks to complete (hooks: test-hook)",
+								Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 							},
 						},
 					},
@@ -1203,7 +1200,7 @@ func TestDeletingCondition(t *testing.T) {
 				Type:    clusterv1.MachineDeletingV1Beta2Condition,
 				Status:  metav1.ConditionTrue,
 				Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookV1Beta2Reason,
-				Message: "Waiting for pre-drain hooks to complete (hooks: test-hook)",
+				Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 			},
 		},
 	}
@@ -1412,7 +1409,7 @@ func TestSetReadyCondition(t *testing.T) {
 								Type:    clusterv1.MachineDeletingV1Beta2Condition,
 								Status:  metav1.ConditionTrue,
 								Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookV1Beta2Reason,
-								Message: "Waiting for pre-drain hooks to complete (hooks: test-hook)",
+								Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 							},
 						},
 					},
@@ -1791,7 +1788,7 @@ After above Pods have been removed from the Node, the following Pods will be evi
 								Type:    clusterv1.MachineDeletingV1Beta2Condition,
 								Status:  metav1.ConditionTrue,
 								Reason:  clusterv1.MachineDeletingWaitingForPreDrainHookV1Beta2Reason,
-								Message: "Waiting for pre-drain hooks to complete (hooks: test-hook)",
+								Message: "Waiting for pre-drain hooks to succeed (hooks: test-hook)",
 							},
 						},
 					},

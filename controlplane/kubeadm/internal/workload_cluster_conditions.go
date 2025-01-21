@@ -67,8 +67,11 @@ func (w *Workload) UpdateEtcdConditions(ctx context.Context, controlPlane *Contr
 	if controlPlane.IsEtcdManaged() {
 		// Update etcd conditions.
 		// In case of well known temporary errors + control plane scaling up/down or rolling out, retry a few times.
-		// Note: this is required because there isn't a watch mechanism on etcd.
-		maxRetry := 3
+		// Note: it seems that reducing the number of them during every reconciles also improves stability,
+		// thus we are stopping doing retries (we only try once).
+		// However, we keep the code implementing retry support so we can easily revert this decision in a patch
+		// release if we need to.
+		maxRetry := 1
 		for i := range maxRetry {
 			retryableError := w.updateManagedEtcdConditions(ctx, controlPlane)
 			// if we should retry and there is a retry left, wait a bit.
@@ -316,6 +319,17 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 	return retryableError
 }
 
+func unwrapAll(err error) error {
+	for {
+		newErr := errors.Unwrap(err)
+		if newErr == nil {
+			break
+		}
+		err = newErr
+	}
+	return err
+}
+
 func (w *Workload) getCurrentEtcdMembers(ctx context.Context, machine *clusterv1.Machine, nodeName string) ([]*etcd.Member, error) {
 	// Create the etcd Client for the etcd Pod scheduled on the Node
 	etcdClient, err := w.etcdClientGenerator.forFirstAvailableNode(ctx, []string{nodeName})
@@ -326,7 +340,7 @@ func (w *Workload) getCurrentEtcdMembers(ctx context.Context, machine *clusterv1
 			Type:    controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
 			Status:  metav1.ConditionUnknown,
 			Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberInspectionFailedV1Beta2Reason,
-			Message: fmt.Sprintf("Failed to connect to the etcd Pod on the %s Node: %s", nodeName, err),
+			Message: fmt.Sprintf("Failed to connect to the etcd Pod on the %s Node: %s", nodeName, unwrapAll(err)),
 		})
 		return nil, errors.Wrapf(err, "failed to get current etcd members: failed to connect to the etcd Pod on the %s Node", nodeName)
 	}
@@ -1015,6 +1029,15 @@ func aggregateV1Beta2ConditionsFromMachinesToKCP(input aggregateV1Beta2Condition
 					}
 					machineMessages = append(machineMessages, fmt.Sprintf("  * %s: %s", machineCondition.Type, m))
 				case metav1.ConditionUnknown:
+					// Ignore unknown when the machine doesn't have a provider ID yet (which also implies infrastructure not ready).
+					// Note: this avoids some noise when a new machine is provisioning; it is not possible to delay further
+					// because the etcd member might join the cluster / control plane components might start even before
+					// kubelet registers the node to the API server (e.g. in case kubelet has issues to register itself).
+					if machine.Spec.ProviderID == nil {
+						kcpMachinesWithInfo.Insert(machine.Name)
+						break
+					}
+
 					kcpMachinesWithUnknown.Insert(machine.Name)
 					m := machineCondition.Message
 					if m == "" {
