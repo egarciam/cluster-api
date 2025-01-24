@@ -1168,6 +1168,7 @@ func autoConvert_v1beta1_MachineDeploymentSpec_To_v1alpha4_MachineDeploymentSpec
 	} else {
 		out.Strategy = nil
 	}
+	// WARNING: in.MachineNamingStrategy requires manual conversion: does not exist in peer-type
 	out.MinReadySeconds = (*int32)(unsafe.Pointer(in.MinReadySeconds))
 	out.RevisionHistoryLimit = (*int32)(unsafe.Pointer(in.RevisionHistoryLimit))
 	out.Paused = in.Paused
@@ -1556,6 +1557,7 @@ func autoConvert_v1beta1_MachineSetSpec_To_v1alpha4_MachineSetSpec(in *v1beta1.M
 	if err := Convert_v1beta1_MachineTemplateSpec_To_v1alpha4_MachineTemplateSpec(&in.Template, &out.Template, s); err != nil {
 		return err
 	}
+	// WARNING: in.MachineNamingStrategy requires manual conversion: does not exist in peer-type
 	return nil
 }
 
@@ -1757,6 +1759,7 @@ func Convert_v1alpha4_Topology_To_v1beta1_Topology(in *Topology, out *v1beta1.To
 
 func autoConvert_v1beta1_Topology_To_v1alpha4_Topology(in *v1beta1.Topology, out *Topology, s conversion.Scope) error {
 	out.Class = in.Class
+	// WARNING: in.ClassNamespace requires manual conversion: does not exist in peer-type
 	out.Version = in.Version
 	out.RolloutAfter = (*metav1.Time)(unsafe.Pointer(in.RolloutAfter))
 	if err := Convert_v1beta1_ControlPlaneTopology_To_v1alpha4_ControlPlaneTopology(&in.ControlPlane, &out.ControlPlane, s); err != nil {

@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apiserver/pkg/storage/names"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -200,17 +199,12 @@ func (r *KubeadmControlPlaneReconciler) cloneConfigsAndGenerateMachine(ctx conte
 		UID:        kcp.UID,
 	}
 
-	infraMachineName := machine.Name
-	if r.DeprecatedInfraMachineNaming {
-		infraMachineName = names.SimpleNameGenerator.GenerateName(kcp.Spec.MachineTemplate.InfrastructureRef.Name + "-")
-	}
-
 	// Clone the infrastructure template
 	infraRef, err := external.CreateFromTemplate(ctx, &external.CreateFromTemplateInput{
 		Client:      r.Client,
 		TemplateRef: &kcp.Spec.MachineTemplate.InfrastructureRef,
 		Namespace:   kcp.Namespace,
-		Name:        infraMachineName,
+		Name:        machine.Name,
 		OwnerRef:    infraCloneOwner,
 		ClusterName: cluster.Name,
 		Labels:      internal.ControlPlaneMachineLabelsForCluster(kcp, cluster.Name),
@@ -373,12 +367,12 @@ func (r *KubeadmControlPlaneReconciler) computeDesiredMachine(kcp *controlplanev
 		if kcp.Spec.MachineNamingStrategy != nil && kcp.Spec.MachineNamingStrategy.Template != "" {
 			nameTemplate = kcp.Spec.MachineNamingStrategy.Template
 			if !strings.Contains(nameTemplate, "{{ .random }}") {
-				return nil, errors.New("cannot generate KCP machine name: {{ .random }} is missing in machineNamingStrategy.template")
+				return nil, errors.New("cannot generate Machine name: {{ .random }} is missing in machineNamingStrategy.template")
 			}
 		}
 		generatedMachineName, err := topologynames.KCPMachineNameGenerator(nameTemplate, cluster.Name, kcp.Name).GenerateName()
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to generate name for KCP Machine")
+			return nil, errors.Wrap(err, "failed to generate Machine name")
 		}
 		machineName = generatedMachineName
 		version = &kcp.Spec.Version

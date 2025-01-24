@@ -173,6 +173,8 @@ linters-settings:
       # CAPI utils
       - pkg: sigs.k8s.io/cluster-api/util/conditions/v1beta2
         alias: v1beta2conditions
+      - pkg: sigs.k8s.io/cluster-api/internal/topology/names
+        alias: topologynames
       # CAPD
       - pkg: sigs.k8s.io/cluster-api/test/infrastructure/docker/api/v1alpha3
         alias: infrav1alpha3
@@ -271,6 +273,10 @@ issues:
   - linters:
     - staticcheck
     text: "SA1019: (clusterv1alpha3.*|clusterv1alpha4.*) is deprecated: This type will be removed in one of the next releases."
+  # Specific exclude rules for deprecated feature flags
+  - linters:
+      - staticcheck
+    text: "SA1019: feature.ClusterResourceSet is deprecated: ClusterResourceSet feature is now GA and the corresponding feature flag will be removed in 1.12 release."
   - linters:
     - revive
     text: "exported: exported method .*\\.(Reconcile|SetupWithManager|SetupWebhookWithManager) should have comment or be unexported"
